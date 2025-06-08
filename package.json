@@ -1,25 +1,29 @@
 {
-  "name": "sdk",
+  "name": "solana-flash-loan-sdk",
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "tsx example.ts",
+    "build": "tsc"
   },
-  "keywords": [],
+  "keywords": ["solana", "flash-loan", "jupiter", "defi"],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "A TypeScript SDK for Solana flash loans with Jupiter DEX integration",
   "dependencies": {
-    "@okx-dex/okx-dex-sdk": "^1.0.13",
+    "@coral-xyz/anchor": "^0.30.0",
+    "@solana/web3.js": "^1.95.0",
+    "@solana/spl-token": "^0.4.8",
     "@solendprotocol/solend-sdk": "^0.13.35",
     "bn.js": "^5.2.2",
     "bs58": "^6.0.0",
-    "crypto": "^1.0.1",
-    "debug": "^4.4.1",
-    "node-fetch": "^3.3.2",
-    "rpc-websockets": "^7.11.0"
+    "dotenv": "^16.4.5"
   },
   "devDependencies": {
-    "tsx": "^4.19.4"
+    "tsx": "^4.19.4",
+    "typescript": "^5.0.0",
+    "@types/bn.js": "^5.1.5",
+    "@types/node": "^20.0.0"
   }
 }
