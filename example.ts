@@ -3,6 +3,11 @@ import { buildSimulatedFlashLoanInstructions } from "./sdk/flash_swap";
 import { Wallet } from "@coral-xyz/anchor";
 import { SOLANA_PRIVATE_KEY, SOLANA_RPC_URL, USDC_MINT_KEY, SOLEND_ENVIRONMENT } from "./sdk/const";
 import bs58 from "bs58";
+import { LaunchDetector } from './sdk/launch_detector';
+import * as dotenv from 'dotenv';
+
+// Load environment variables
+dotenv.config();
 
 async function main() {
     // Use the RPC URL directly from environment
@@ -128,6 +133,112 @@ async function main() {
         } else {
             console.log("💡 Full error details:", error);
         }
+    }
+
+    // Initialize launch detector with position sizing config
+    const detector = new LaunchDetector(
+        connection,
+        {
+            minLiquidity: 10000,    // $10k minimum liquidity
+            maxSlippage: 0.01,      // 1% max slippage
+            targetProfitPercentage: 0.03, // 3% target profit
+            maxGasPrice: 1000000,   // 0.001 SOL max gas
+            dexes: ['raydium', 'jupiter'],
+            blockWindow: 10         // Monitor 10 blocks after launch
+        },
+        {
+            maxPositionSize: 1000,          // $1000 max position
+            minLiquidityRatio: 10,          // 10:1 liquidity to position ratio
+            volatilityMultiplier: 1.0,      // Base multiplier
+            maxRiskPerTrade: 100,           // $100 max risk per trade
+            minProfitThreshold: 0.03        // 3% minimum expected profit
+        }
+    );
+
+    // Set up event listeners
+    detector.on('newLaunch', (launch) => {
+        console.log('\n🚀 New token launch detected:');
+        console.log('Token:', launch.tokenAddress.toString());
+        console.log('Pool:', launch.poolAddress.toString());
+        console.log('DEX:', launch.dex);
+        console.log('Initial Price:', launch.initialPrice);
+        console.log('Liquidity:', launch.liquidity);
+        console.log('Launch Block:', launch.launchBlock);
+        console.log('Timestamp:', new Date(launch.timestamp).toISOString());
+    });
+
+    detector.on('priceUpdate', (update) => {
+        const { launch, currentPrice, priceChange, block, position } = update;
+        console.log('\n📊 Price Update:');
+        console.log('Token:', launch.tokenAddress.toString());
+        console.log('Current Price:', currentPrice);
+        console.log('Price Change:', (priceChange * 100).toFixed(2) + '%');
+        console.log('Block:', block);
+        
+        if (position) {
+            console.log('\n📈 Position Update:');
+            console.log('Size:', position.size.toFixed(2) + ' USD');
+            console.log('Entry Price:', position.entryPrice);
+            console.log('Current PnL:', position.currentPnL.toFixed(2) + ' USD');
+            console.log('PnL %:', ((position.currentPnL / (position.size * position.entryPrice)) * 100).toFixed(2) + '%');
+        }
+    });
+
+    detector.on('sellExecuted', (result) => {
+        console.log('\n💰 Sell Executed:');
+        console.log('Token:', result.tokenAddress.toString());
+        console.log('Entry Price:', result.entryPrice);
+        console.log('Exit Price:', result.exitPrice);
+        console.log('Position Size:', result.positionSize.toFixed(2) + ' USD');
+        console.log('PnL:', result.pnl.toFixed(2) + ' USD');
+        console.log('PnL %:', ((result.pnl / (result.positionSize * result.entryPrice)) * 100).toFixed(2) + '%');
+        console.log('Timestamp:', new Date(result.timestamp).toISOString());
+    });
+
+    detector.on('sellError', (error) => {
+        console.log('\n❌ Sell Error:');
+        console.log('Token:', error.tokenAddress.toString());
+        console.log('Error:', error.error);
+        console.log('Timestamp:', new Date(error.timestamp).toISOString());
+    });
+
+    try {
+        // Initialize and start monitoring
+        console.log('Initializing launch detector...');
+        await detector.initialize();
+        console.log('Launch detector initialized and monitoring for new pools...');
+
+        // Example of updating position sizing config
+        setTimeout(() => {
+            console.log('\n🔄 Updating position sizing config...');
+            detector.updatePositionSizingConfig({
+                maxPositionSize: 2000,          // Increase max position size
+                volatilityMultiplier: 0.8       // Reduce position size for volatile tokens
+            });
+        }, 300000); // Update after 5 minutes
+
+        // Keep the process running
+        process.on('SIGINT', async () => {
+            console.log('\nStopping launch detector...');
+            // Log final positions
+            const activePositions = detector.getActivePositions();
+            if (activePositions.length > 0) {
+                console.log('\n📊 Final Positions:');
+                activePositions.forEach(position => {
+                    console.log(`Token: ${position.tokenAddress.toString()}`);
+                    console.log(`Size: ${position.positionSize.toFixed(2)} USD`);
+                    console.log(`Entry Price: ${position.entryPrice}`);
+                    console.log(`Highest Price: ${position.highestPrice}`);
+                    console.log(`Lowest Price: ${position.lowestPrice}`);
+                    console.log('---');
+                });
+            }
+            process.exit(0);
+        });
+
+    } catch (error) {
+        console.error('Error initializing launch detector:', error);
+        process.exit(1);
     }
 }
 
