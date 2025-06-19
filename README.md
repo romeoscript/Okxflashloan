@@ -1,30 +1,18 @@
-# Solana Flash Loan Service
+# OKX Flashloan Service - Solana Token Monitor
 
-A TypeScript service that enables flash loan operations on Solana on any OKX DEX API tokens.
-
-## Features
-
-- Flash loan borrowing and repayment using Solend Protocol
-- Token swaps using OKX DEX aggregator
-- Automatic Associated Token Account (ATA) creation
-- Support for custom user instructions
-- Transaction simulation before execution
-- Slippage protection
-- Rate estimation for token swaps
+This service monitors new token listings on Raydium DEX by watching the Raydium fee account for new transactions.
 
 ## Prerequisites
 
-- Node.js (v16 or higher)
-- Solana CLI tools
-- A Solana wallet with SOL
-- OKX API credentials
+- Node.js 16+ installed
+- A Solana RPC endpoint with WebSocket support (recommended providers: QuickNode, Helius, or Alchemy)
 
-## Installation
+## Setup
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/s29papi/OKX-FLASHLOAN-SERVICE
-cd OKX-FLASHLOAN-SERVICE
+git clone https://github.com/yourusername/okx-flashloan-service.git
+cd okx-flashloan-service
 ```
 
 2. Install dependencies:
@@ -32,106 +20,45 @@ cd OKX-FLASHLOAN-SERVICE
 npm install
 ```
 
-3. Create a `.env` file in the root directory with the following variables:
-```env
-OKX_API_KEY=your_okx_api_key
-OKX_SECRET_KEY=your_okx_secret_key
-OKX_API_PASSPHRASE=your_okx_passphrase
-OKX_PROJECT_ID=your_okx_project_id
-SOLANA_RPC_URL=your_solana_rpc_url
-SOLANA_PRIVATE_KEY=your_solana_private_key
+3. Update the RPC endpoint:
+Edit `src/constants.ts` and replace the default RPC URL with your own endpoint:
+```typescript
+export const solanaConnection = new Connection('YOUR_RPC_ENDPOINT', {
+  commitment: 'confirmed',
+  wsEndpoint: 'YOUR_WSS_ENDPOINT'
+});
 ```
 
 ## Usage
 
-### Basic Flash Loan with Token Swap
-
-```typescript
-import { buildSimulatedFlashLoanInstructions } from './sdk/flash_swap';
-import { Connection, PublicKey } from '@solana/web3.js';
-import { Wallet } from '@okx-dex/okx-dex-sdk';
-
-async function executeFlashLoan() {
-    const connection = new Connection(process.env.SOLANA_RPC_URL!);
-    const wallet = new Wallet(/* your wallet implementation */);
-    
-    const targetTokenMint = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"); // USDC
-    const desiredAmount = "1000"; // Amount in target token decimals
-    
-    const { instructions, lookupTableAccounts } = await buildSimulatedFlashLoanInstructions({
-        targetTokenMint,
-        desiredTargetAmount: desiredAmount,
-        slippage: "0.1",
-        connection,
-        wallet
-    });
-    
-    // Execute the transaction
-    // ... your transaction execution logic
-}
+1. Build the project:
+```bash
+npm run build
 ```
 
-### Adding Custom Instructions
-
-You can add custom instructions to be executed between the flash loan borrow and repay:
-
-```typescript
-const customInstructions = [
-    // Your custom instructions here
-];
-
-const { instructions, lookupTableAccounts } = await buildSimulatedFlashLoanInstructions({
-    targetTokenMint,
-    desiredTargetAmount: desiredAmount,
-    userInstructions: customInstructions,
-    connection,
-    wallet
-});
+2. Start the monitoring service:
+```bash
+npm start
 ```
 
-## Configuration
+Or run in development mode:
+```bash
+npm run dev
+```
 
-The service uses several constants defined in `sdk/const.ts`:
+## Data Storage
 
-- `LENDING_PROGRAM_ID`: Solend Protocol program ID
-- `SUPPLYPUBKEY`: Liquidity address
-- `LENDING_MARKET`: Reserve lending market
-- `RESERVE_ADDRESS`: Reserve address
-- `FEE_RECEIVER_ADDRESS`: Fee receiver address
-- `WSOL_MINT_KEY`: WSOL mint address
+The service stores new token data in `src/data/new_solana_tokens.json`. Each entry contains:
+- Transaction signature
+- Token creator address
+- Base token information (address, decimals, LP amount)
+- Quote token information (SOL)
+- Transaction logs
+
+Error logs are stored in `errorNewLpsLogs.txt`.
 
 ## Important Notes
 
-1. Always simulate transactions before executing them
-2. Ensure sufficient SOL for transaction fees
-3. Consider slippage when swapping tokens
-4. The service automatically creates ATAs if they don't exist
-5. Flash loans must be repaid within the same transaction
-
-## Error Handling
-
-The service includes error handling for:
-- Missing token accounts
-- Failed simulations
-- Invalid API responses
-- Lookup table loading failures
-
-## Security Considerations
-
-1. Never commit your `.env` file
-2. Keep your private keys secure
-3. Use appropriate slippage values
-4. Test with small amounts first
-5. Monitor transaction simulations
-
-## Contributing
-
-1. Fork the repository
-2. Create your feature branch
-3. Commit your changes
-4. Push to the branch
-5. Create a Pull Request
-
-## License
-
-MIT
+- The service requires a reliable RPC endpoint with WebSocket support for proper functionality
+- High-quality RPC providers are recommended for production use
+- The service monitors the Raydium fee account: `5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1`

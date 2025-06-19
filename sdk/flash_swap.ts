@@ -516,7 +516,8 @@ export async function buildSimulatedFlashLoanInstructions({
         return true;
     });
 
-    if (validLookupTables.length === 0 && lookupTableAccounts.length > 0) {
+    // Only throw if we have lookup tables but none are valid
+    if (lookupTableAccounts.length > 0 && validLookupTables.length === 0) {
       throw new Error('No valid lookup tables available for transaction compilation');
     }
 
@@ -526,7 +527,7 @@ export async function buildSimulatedFlashLoanInstructions({
       payerKey: wallet.publicKey,
       recentBlockhash: latestBlockhash.blockhash,
       instructions: allInstructions
-    }).compileToV0Message(validLookupTables);
+    }).compileToV0Message(validLookupTables.length > 0 ? validLookupTables : undefined);
 
     return {
       transaction: new VersionedTransaction(messageV0),

@@ -1,5 +1,5 @@
 import { Connection, PublicKey } from '@solana/web3.js';
-import { Market } from '@raydium-io/raydium-sdk';
+import { Market, LIQUIDITY_STATE_LAYOUT_V4, Liquidity } from '@raydium-io/raydium-sdk';
 import { QuoteResponse, SwapRequest } from '@jup-ag/api';
 import { EventEmitter } from 'events';
 
@@ -53,7 +53,12 @@ export interface TradePosition {
     lowestPrice: number;
     lastUpdateTime: number;
     autoSellConfig: AutoSellConfig;
+    currentPrice?: number;  // Current market price
+    currentPnL?: number;    // Current profit/loss in USD
 }
+
+// Constants
+const RAYDIUM_AMM_PROGRAM_ID = new PublicKey('675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8');
 
 export class LaunchDetector extends EventEmitter {
     private connection: Connection;
@@ -62,6 +67,7 @@ export class LaunchDetector extends EventEmitter {
     private activePositions: Map<string, TradePosition>;
     private raydiumMarkets: Map<string, Market>;
     private positionSizingConfig: PositionSizingConfig;
+    private isMonitoring: boolean;
 
     constructor(
         connection: Connection,
@@ -90,6 +96,7 @@ export class LaunchDetector extends EventEmitter {
             minProfitThreshold: 0.03,       // 3% minimum expected profit
             ...positionSizingConfig
         };
+        this.isMonitoring = false;
     }
 
     async initialize() {
@@ -119,21 +126,89 @@ export class LaunchDetector extends EventEmitter {
 
     private async monitorRaydiumPools() {
         // Subscribe to Raydium pool creation events
-        // Implementation will depend on Raydium SDK version
+        
+        try {
+            // Subscribe to program account changes
+            this.connection.onProgramAccountChange(
+                RAYDIUM_AMM_PROGRAM_ID,
+                async (accountInfo) => {
+                    if (!this.isMonitoring) return;
+                    
+                    try {
+                        const poolAddress = accountInfo.accountId;
+                        await this.detectNewPool(poolAddress, 'raydium');
+                    } catch (error) {
+                        console.error('Error processing Raydium pool:', error);
+                    }
+                },
+                'confirmed',
+                [{ dataSize: 752 }] // Filter for AMM pool accounts
+            );
+            
+            console.log('Started monitoring Raydium pools');
+        } catch (error) {
+            console.error('Error setting up Raydium pool monitoring:', error);
+        }
     }
 
     private async monitorJupiterPools() {
+        if (!this.isMonitoring) return;
+
         // Subscribe to Jupiter pool creation events using their API
-        // We'll need to implement a polling mechanism since Jupiter doesn't provide
-        // direct event subscription
-        setInterval(async () => {
+        const JUPITER_API_ENDPOINT = 'https://token.jup.ag/all';
+        let knownTokens = new Set<string>();
+
+        const checkNewTokens = async () => {
+            if (!this.isMonitoring) return;
+
             try {
-                // Fetch new pools from Jupiter API
-                // Implementation will depend on Jupiter API endpoints
+                const response = await fetch(JUPITER_API_ENDPOINT);
+                const data = await response.json();
+                const tokens = data.tokens || [];
+
+                // Check for new tokens
+                for (const token of tokens) {
+                    if (!knownTokens.has(token.address)) {
+                        knownTokens.add(token.address);
+                        
+                        // For new tokens, check if they have pools
+                        const tokenAddress = new PublicKey(token.address);
+                        const poolAddress = await this.findJupiterPool(tokenAddress);
+                        
+                        if (poolAddress) {
+                            await this.detectNewPool(poolAddress, 'jupiter');
+                        }
+                    }
+                }
             } catch (error) {
                 console.error('Error monitoring Jupiter pools:', error);
             }
-        }, 1000); // Poll every second
+        };
+
+        // Initial check
+        await checkNewTokens();
+
+        // Set up polling interval
+        setInterval(checkNewTokens, 1000); // Poll every second
+        console.log('Started monitoring Jupiter pools');
+    }
+
+    private async findJupiterPool(tokenAddress: PublicKey): Promise<PublicKey | null> {
+        try {
+            // Query Jupiter API to find pool for the token
+            const response = await fetch(`https://price.jup.ag/v4/price?ids=${tokenAddress.toString()}`);
+            const data = await response.json();
+            
+            if (data.data && data.data[tokenAddress.toString()]) {
+                // Extract pool address from the response
+                // This is a simplified example - actual implementation would need to
+                // parse the Jupiter response format correctly
+                return new PublicKey(data.data[tokenAddress.toString()].poolAddress);
+            }
+        } catch (error) {
+            console.error('Error finding Jupiter pool:', error);
+        }
+        return null;
     }
 
     async detectNewPool(
@@ -177,9 +252,48 @@ export class LaunchDetector extends EventEmitter {
         poolAddress: PublicKey,
         dex: 'raydium' | 'jupiter'
     ): Promise<PoolData> {
-        // Implementation will fetch pool data based on DEX
-        // Returns: { tokenAddress, price, liquidity }
-        throw new Error('Not implemented');
+        try {
+            if (dex === 'raydium') {
+                // Fetch Raydium pool data
+                const poolInfo = await this.connection.getAccountInfo(poolAddress);
+                if (!poolInfo) throw new Error('Pool not found');
+
+                // Parse Raydium pool data using Raydium SDK
+                const poolState = LIQUIDITY_STATE_LAYOUT_V4.decode(poolInfo.data);
+                
+                // Calculate price and liquidity from pool state
+                const baseDecimal = Math.pow(10, poolState.baseDecimal.toNumber());
+                const quoteDecimal = Math.pow(10, poolState.quoteDecimal.toNumber());
+                const baseReserve = poolState.baseReserve.toNumber() / baseDecimal;
+                const quoteReserve = poolState.quoteReserve.toNumber() / quoteDecimal;
+                const price = quoteReserve / baseReserve;
+                const liquidity = quoteReserve * 2; // Total liquidity in quote currency
+
+                return {
+                    tokenAddress: poolState.baseMint,
+                    price,
+                    liquidity
+                };
+            } else {
+                // Fetch Jupiter pool data
+                const response = await fetch(`https://price.jup.ag/v4/price?ids=${poolAddress.toString()}`);
+                const data = await response.json();
+                
+                if (!data.data || !data.data[poolAddress.toString()]) {
+                    throw new Error('Pool not found');
+                }
+
+                const poolData = data.data[poolAddress.toString()];
+                return {
+                    tokenAddress: new PublicKey(poolData.tokenMint),
+                    price: parseFloat(poolData.price),
+                    liquidity: parseFloat(poolData.liquidity)
+                };
+            }
+        } catch (error) {
+            console.error(`Error fetching ${dex} pool data:`, error);
+            throw error;
+        }
     }
 
     private validatePool(poolData: PoolData): boolean {
@@ -406,7 +520,36 @@ export class LaunchDetector extends EventEmitter {
         }
     }
 
-    async stopMonitoring(poolAddress: PublicKey) {
-        this.activeLaunches.delete(poolAddress.toString());
+    public async stopMonitoring(poolAddress?: PublicKey): Promise<void> {
+        if (poolAddress) {
+            // Stop monitoring a specific pool
+            this.activeLaunches.delete(poolAddress.toString());
+        } else {
+            // Stop all monitoring
+            if (!this.isMonitoring) return;
+            this.isMonitoring = false;
+            this.activeLaunches.clear();
+            this.activePositions.clear();
+            console.log('Stopped monitoring for new token launches...');
+        }
+    }
+
+    public getConfig(): LaunchConfig {
+        return { ...this.config };
+    }
+
+    public async startMonitoring(): Promise<void> {
+        if (this.isMonitoring) return;
+        this.isMonitoring = true;
+        await this.startPoolMonitoring();
+        console.log('Started monitoring for new token launches...');
+    }
+
+    public getTotalTrades(): number {
+        return this.activePositions.size;
+    }
+
+    public getPositionSizingConfig(): PositionSizingConfig {
+        return { ...this.positionSizingConfig };
     }
 }
