@@ -646,6 +646,11 @@ _Use /positions to view current positions_
         }
     }
 
+    // Public method for external components to send notifications
+    async sendNotification(message: string) {
+        await this.broadcastMessage(message);
+    }
+
     private async handleStatusCommand(chatId: number) {
         const positions = this.detector.getActivePositions();
         const totalPnL = positions.reduce((sum, pos) => sum + (pos.currentPnL || 0), 0);

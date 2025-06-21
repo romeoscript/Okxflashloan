@@ -10,7 +10,10 @@
     "build": "tsc",
     "dev:api": "nodemon --watch 'sdk/**/*.ts' --watch 'server.ts' --exec 'tsx' server.ts",
     "dev:bot": "nodemon --watch 'sdk/**/*.ts' --watch 'bot.ts' --exec 'tsx' bot.ts",
-    "dev:all": "concurrently \"npm run dev:api\" \"npm run dev:bot\""
+    "dev:all": "concurrently \"npm run dev:api\" \"npm run dev:bot\"",
+    "start": "node dist/bot.js",
+    "monitor": "ts-node src/monitorNewTokens.ts",
+    "test:connection": "tsx test-connection.ts"
   },
   "keywords": [
     "solana",

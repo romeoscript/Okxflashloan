@@ -5,6 +5,9 @@ import { Connection, PublicKey, Keypair } from '@solana/web3.js';
 import dotenv from 'dotenv';
 import { Wallet } from '@coral-xyz/anchor';
 import bs58 from 'bs58';
+import { monitorNewTokens, NewTokenData } from './src/monitorNewTokens';
+import fs from 'fs';
+import path from 'path';
 
 dotenv.config();
 
@@ -14,6 +17,10 @@ app.use(express.json());
 // Initialize Solana connection and LaunchDetector
 const connection = new Connection(process.env.RPC_ENDPOINT || '', 'confirmed');
 const detector = new LaunchDetector(connection);
+
+// Store new token monitoring state
+let newTokenMonitorCleanup: (() => void) | null = null;
+let isNewTokenMonitoring = false;
 
 // --- LaunchDetector Endpoints ---
 
@@ -142,6 +149,129 @@ app.get('/flashswap/quote', async (req, res) => {
   } catch (err) {
     console.error('FlashSwap quote error:', err);
     res.status(500).json({ error: 'Failed to get flash swap quote', details: err instanceof Error ? err.message : err });
+  }
+});
+
+// --- New Token Monitoring Endpoints ---
+
+// Start monitoring for new tokens
+app.post('/tokens/monitor/start', async (req, res) => {
+  try {
+    if (isNewTokenMonitoring) {
+      res.status(400).json({ error: 'New token monitoring is already running' });
+      return;
+    }
+
+    newTokenMonitorCleanup = await monitorNewTokens(connection);
+    isNewTokenMonitoring = true;
+
+    res.json({ 
+      status: 'started', 
+      message: 'New token monitoring has been started successfully' 
+    });
+  } catch (err) {
+    console.error('New token monitoring start error:', err);
+    res.status(500).json({ 
+      error: 'Failed to start new token monitoring', 
+      details: err instanceof Error ? err.message : err 
+    });
+  }
+});
+
+// Stop monitoring for new tokens
+app.post('/tokens/monitor/stop', async (req, res) => {
+  try {
+    if (!isNewTokenMonitoring) {
+      res.status(400).json({ error: 'New token monitoring is not running' });
+      return;
+    }
+
+    if (newTokenMonitorCleanup) {
+      newTokenMonitorCleanup();
+      newTokenMonitorCleanup = null;
+    }
+    isNewTokenMonitoring = false;
+
+    res.json({ 
+      status: 'stopped', 
+      message: 'New token monitoring has been stopped successfully' 
+    });
+  } catch (err) {
+    console.error('New token monitoring stop error:', err);
+    res.status(500).json({ 
+      error: 'Failed to stop new token monitoring', 
+      details: err instanceof Error ? err.message : err 
+    });
+  }
+});
+
+// Get monitoring status
+app.get('/tokens/monitor/status', (req, res) => {
+  res.json({ 
+    isMonitoring: isNewTokenMonitoring,
+    message: isNewTokenMonitoring ? 'New token monitoring is active' : 'New token monitoring is not running'
+  });
+});
+
+// Get all new tokens data
+app.get('/tokens/new', (req, res) => {
+  try {
+    const dataPath = path.join(__dirname, 'src', 'data', 'new_solana_tokens.json');
+    
+    if (!fs.existsSync(dataPath)) {
+      res.json({ tokens: [] });
+      return;
+    }
+
+    const data = fs.readFileSync(dataPath, 'utf8');
+    const tokens = JSON.parse(data);
+    
+    res.json({ 
+      tokens: Array.isArray(tokens) ? tokens : [tokens],
+      count: Array.isArray(tokens) ? tokens.length : 1
+    });
+  } catch (err) {
+    console.error('Error reading new tokens data:', err);
+    res.status(500).json({ 
+      error: 'Failed to read new tokens data', 
+      details: err instanceof Error ? err.message : err 
+    });
+  }
+});
+
+// Get recent new tokens (with optional limit)
+app.get('/tokens/new/recent', (req, res) => {
+  try {
+    const { limit = 10 } = req.query;
+    const dataPath = path.join(__dirname, 'src', 'data', 'new_solana_tokens.json');
+    
+    if (!fs.existsSync(dataPath)) {
+      res.json({ tokens: [] });
+      return;
+    }
+
+    const data = fs.readFileSync(dataPath, 'utf8');
+    const tokens = JSON.parse(data);
+    const tokenArray = Array.isArray(tokens) ? tokens : [tokens];
+    
+    // Sort by timestamp (newest first) and limit results
+    const sortedTokens = tokenArray
+      .sort((a: NewTokenData, b: NewTokenData) => 
+        new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+      )
+      .slice(0, Number(limit));
+    
+    res.json({ 
+      tokens: sortedTokens,
+      count: sortedTokens.length,
+      total: tokenArray.length
+    });
+  } catch (err) {
+    console.error('Error reading recent new tokens:', err);
+    res.status(500).json({ 
+      error: 'Failed to read recent new tokens', 
+      details: err instanceof Error ? err.message : err 
+    });
   }
 });
 
