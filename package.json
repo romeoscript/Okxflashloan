@@ -13,7 +13,8 @@
     "dev:all": "concurrently \"npm run dev:api\" \"npm run dev:bot\"",
     "start": "node dist/bot.js",
     "monitor": "ts-node src/monitorNewTokens.ts",
-    "test:connection": "tsx test-connection.ts"
+    "test:connection": "tsx test-connection.ts",
+    "flash-arbitrage": "tsx example-flash-arbitrage.ts"
   },
   "keywords": [
     "solana",
