@@ -3,6 +3,7 @@ import axios from 'axios';
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { EmbeddedWalletManager, EmbeddedWalletSession } from './embedded_wallet_manager';
+import { DatabaseManager } from './database_manager';
 
 // Bot configuration interface
 interface BotConfig {
@@ -53,6 +54,7 @@ export class SnipingBot {
     private authorizedUsers: Set<number>;
     private apiBaseUrl: string;
     private walletManager: EmbeddedWalletManager;
+    private databaseManager: DatabaseManager;
     private readonly welcomeMessage = `
 🚀 *Welcome to Solana Flash Loan Bot\\!*
 
@@ -75,7 +77,8 @@ Your wallet is fully controlled by you \\- we never have access to your funds\\!
     constructor(token: string, authorizedUserIds: number[], connection: Connection, apiBaseUrl: string = 'http://localhost:3000') {
         this.bot = new TelegramBot(token, { polling: true });
         this.authorizedUserIds = authorizedUserIds;
-        this.walletManager = new EmbeddedWalletManager(connection);
+        this.databaseManager = new DatabaseManager();
+        this.walletManager = new EmbeddedWalletManager(connection, this.databaseManager);
         this.config = {
             minLiquidity: 10000,    // $10k minimum liquidity
             maxSlippage: 0.01,      // 1% max slippage
@@ -190,8 +193,11 @@ Your wallet is fully controlled by you \\- we never have access to your funds\\!
                 return;
             }
 
-            const tokenMint = match![1];
-            await this.handleFlashQuoteCommand(msg.chat.id, tokenMint, "1"); // Default 1 SOL
+            const parts = match![1].trim().split(/\s+/);
+            const tokenMint = parts[0];
+            const amount = parts[1] || "1"; // Default to 1 SOL if no amount specified
+            
+            await this.handleFlashQuoteCommand(msg.chat.id, msg.from!.id, tokenMint, amount);
         });
 
         // Create wallet command
@@ -265,8 +271,8 @@ Your wallet is fully controlled by you \\- we never have access to your funds\\!
 
             // Handle token mint addresses for flash quotes
             if (msg.text.length === 44 && /^[A-Za-z0-9]{44}$/.test(msg.text)) {
-                if (this.walletManager.hasWallet(userId)) {
-                    await this.handleFlashQuoteCommand(chatId, msg.text, "1");
+                if (await this.walletManager.hasWallet(userId)) {
+                    await this.handleFlashQuoteCommand(chatId, userId, msg.text, "1");
                 } else {
                     await this.bot.sendMessage(chatId, 
                         '❌ Please create a wallet first using /createwallet or the "Create Wallet" button.');
@@ -276,7 +282,7 @@ Your wallet is fully controlled by you \\- we never have access to your funds\\!
     }
 
     private async handleWalletStatus(chatId: number, userId: number) {
-        const walletInfo = this.walletManager.getWalletInfo(userId);
+        const walletInfo = await this.walletManager.getWalletInfo(userId);
         
         if (walletInfo) {
             const balance = await this.walletManager.getWalletBalance(userId);
@@ -306,7 +312,7 @@ Your embedded wallet is ready for flash loans\\!
     }
 
     private async handleDisconnectWallet(chatId: number, userId: number) {
-        const success = this.walletManager.deleteWallet(userId);
+        const success = await this.walletManager.deleteWallet(userId);
         
         if (success) {
             await this.bot.sendMessage(chatId, '✅ Wallet deleted successfully.');
@@ -316,7 +322,7 @@ Your embedded wallet is ready for flash loans\\!
     }
 
     private async handleWalletInfo(chatId: number, userId: number) {
-        const walletInfo = this.walletManager.getWalletInfo(userId);
+        const walletInfo = await this.walletManager.getWalletInfo(userId);
         
         if (walletInfo) {
             const balance = await this.walletManager.getWalletBalance(userId);
@@ -344,7 +350,7 @@ Your wallet is ready for flash loans and swaps\\!
     }
 
     private async handleBackupWallet(chatId: number, userId: number) {
-        const mnemonic = this.walletManager.backupWallet(userId);
+        const mnemonic = await this.walletManager.backupWallet(userId);
         
         if (mnemonic) {
             // Escape special characters for Telegram markdown
@@ -374,7 +380,7 @@ Your wallet is ready for flash loans and swaps\\!
     }
 
     private async handleExportWallet(chatId: number, userId: number) {
-        const exportData = this.walletManager.exportWallet(userId);
+        const exportData = await this.walletManager.exportWallet(userId);
         
         if (exportData) {
             await this.bot.sendMessage(chatId, exportData.message, {
@@ -387,7 +393,7 @@ Your wallet is ready for flash loans and swaps\\!
     }
 
     private async handleFlashQuoteMenu(chatId: number, userId: number) {
-        if (!this.walletManager.hasWallet(userId)) {
+        if (!(await this.walletManager.hasWallet(userId))) {
             await this.bot.sendMessage(chatId, 
                 '❌ Please create a wallet first using the "Create Wallet" button.');
             return;
@@ -419,7 +425,7 @@ _The default amount is 1 SOL. You can specify a custom amount later._
     }
 
     private async handleFlashSwapMenu(chatId: number, userId: number) {
-        if (!this.walletManager.hasWallet(userId)) {
+        if (!(await this.walletManager.hasWallet(userId))) {
             await this.bot.sendMessage(chatId, 
                 '❌ Please create a wallet first using the "Create Wallet" button.');
             return;
@@ -449,10 +455,10 @@ To execute a flash swap, first get a quote using /flashquote, then follow the in
     }
 
     private async handleCreateWallet(chatId: number, userId: number) {
-        const hasWallet = this.walletManager.hasWallet(userId);
+        const hasWallet = await this.walletManager.hasWallet(userId);
         
         if (hasWallet) {
-            const walletInfo = this.walletManager.getWalletInfo(userId);
+            const walletInfo = await this.walletManager.getWalletInfo(userId);
             const balance = await this.walletManager.getWalletBalance(userId);
             const message = `
 🎉 *Wallet Already Exists*
@@ -498,13 +504,13 @@ Your embedded wallet is ready for flash loans and swaps\\!
         }
     }
 
-    private async handleFlashQuoteCommand(chatId: number, tokenMint: string, amount: string) {
+    private async handleFlashQuoteCommand(chatId: number, userId: number, tokenMint: string, amount: string) {
         const statusMsg = await this.bot.sendMessage(chatId, '🔄 Getting flash loan quote...');
 
         try {
-            const walletInfo = this.walletManager.getWalletInfo(chatId);
+            const walletInfo = await this.walletManager.getWalletInfo(userId);
             if (!walletInfo) {
-                throw new Error('Wallet not found');
+                throw new Error('Wallet not found. Please create a wallet first using /createwallet');
             }
 
             const response = await axios.get(`${this.apiBaseUrl}/flashswap/quote`, {
@@ -512,7 +518,7 @@ Your embedded wallet is ready for flash loans and swaps\\!
                     targetTokenMint: tokenMint,
                     desiredTargetAmount: amount,
                     slippageBps: this.config.maxSlippage * 10000,
-                    walletPublicKey: walletInfo.publicKey
+                    userId: userId
                 }
             });
 
@@ -549,8 +555,24 @@ Your embedded wallet is ready for flash loans and swaps\\!
             });
 
         } catch (error) {
-            const errorMessage = '❌ Failed to get flash swap quote: ' + 
-                (error instanceof Error ? error.message : 'Unknown error');
+            let errorMessage = '❌ Failed to get flash swap quote';
+            
+            if (axios.isAxiosError(error)) {
+                if (error.response?.status === 400) {
+                    errorMessage += ': Invalid parameters or wallet not found';
+                } else if (error.response?.status === 404) {
+                    errorMessage += ': Token not found or no liquidity';
+                } else if (error.response?.status === 500) {
+                    errorMessage += ': Server error - please try again later';
+                } else {
+                    errorMessage += `: ${error.response?.data?.error || error.message}`;
+                }
+            } else if (error instanceof Error) {
+                errorMessage += `: ${error.message}`;
+            } else {
+                errorMessage += ': Unknown error occurred';
+            }
+            
             await this.bot.editMessageText(errorMessage, {
                 chat_id: chatId,
                 message_id: statusMsg.message_id
@@ -793,7 +815,9 @@ _Use the buttons below to control the bot:_
 /recent - View recent tokens for flash arbitrage
 
 *Flash Loan Commands*
-/flashquote <token_mint> <amount> - Get flash swap quote with fees
+/flashquote TOKEN\\_MINT [AMOUNT] \\- Get a flash loan quote
+• Example: \`/flashquote EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 2\`
+• Example: \`/flashquote DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263\` (defaults to 1 SOL)
 /flashswap <token_mint> <amount> - Execute immediate flash swap
 /flasharbitrage <token_mint> <amount> [profit_target%] - Flash arbitrage with profit monitoring
 
@@ -1031,8 +1055,9 @@ We're working on real-time token monitoring capabilities\\.
 • /deletewallet \\- Delete your wallet
 
 **Flash Loan Commands:**
-• /flashquote TOKEN\\_MINT \\- Get a flash loan quote
-• Example: \`/flashquote EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\`
+• /flashquote TOKEN\\_MINT [AMOUNT] \\- Get a flash loan quote
+• Example: \`/flashquote EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 2\`
+• Example: \`/flashquote DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263\` (defaults to 1 SOL)
 
 **How Flash Loans Work:**
 1. Get a quote for the token you want

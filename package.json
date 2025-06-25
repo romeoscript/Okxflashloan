@@ -33,6 +33,7 @@
     "@solana/spl-token": "^0.4.8",
     "@solana/web3.js": "^1.98.2",
     "@solendprotocol/solend-sdk": "^0.13.35",
+    "@supabase/supabase-js": "^2.50.1",
     "@types/express": "^5.0.3",
     "axios": "^1.6.7",
     "bip39": "^3.1.0",

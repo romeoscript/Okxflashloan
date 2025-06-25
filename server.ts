@@ -7,6 +7,7 @@ import { Wallet } from '@coral-xyz/anchor';
 import bs58 from 'bs58';
 import { monitorNewTokens, NewTokenData } from './src/monitorNewTokens';
 import { EmbeddedWalletManager } from './sdk/embedded_wallet_manager';
+import { DatabaseManager } from './sdk/database_manager';
 import fs from 'fs';
 import path from 'path';
 
@@ -18,7 +19,10 @@ app.use(express.json());
 // Initialize Solana connection and LaunchDetector
 const connection = new Connection(process.env.RPC_ENDPOINT || '', 'confirmed');
 const detector = new LaunchDetector(connection);
-const walletManager = new EmbeddedWalletManager(connection);
+
+// Initialize database and wallet manager
+const database = new DatabaseManager();
+const walletManager = new EmbeddedWalletManager(connection, database);
 
 // Store new token monitoring state
 let newTokenMonitorCleanup: (() => void) | null = null;
@@ -51,10 +55,10 @@ app.post('/wallet/create', async (req, res) => {
 });
 
 // GET /wallet/status/:userId
-app.get('/wallet/status/:userId', (req, res) => {
+app.get('/wallet/status/:userId', async (req, res) => {
   try {
     const userId = parseInt(req.params.userId);
-    const walletInfo = walletManager.getWalletInfo(userId);
+    const walletInfo = await walletManager.getWalletInfo(userId);
     
     if (walletInfo) {
       res.json({
@@ -88,10 +92,10 @@ app.get('/wallet/balance/:userId', async (req, res) => {
 });
 
 // GET /wallet/backup/:userId
-app.get('/wallet/backup/:userId', (req, res) => {
+app.get('/wallet/backup/:userId', async (req, res) => {
   try {
     const userId = parseInt(req.params.userId);
-    const mnemonic = walletManager.backupWallet(userId);
+    const mnemonic = await walletManager.backupWallet(userId);
     
     if (mnemonic) {
       res.json({
@@ -108,10 +112,10 @@ app.get('/wallet/backup/:userId', (req, res) => {
 });
 
 // GET /wallet/export/:userId
-app.get('/wallet/export/:userId', (req, res) => {
+app.get('/wallet/export/:userId', async (req, res) => {
   try {
     const userId = parseInt(req.params.userId);
-    const exportData = walletManager.exportWallet(userId);
+    const exportData = await walletManager.exportWallet(userId);
     
     if (exportData) {
       res.json({
@@ -130,10 +134,10 @@ app.get('/wallet/export/:userId', (req, res) => {
 });
 
 // DELETE /wallet/delete/:userId
-app.delete('/wallet/delete/:userId', (req, res) => {
+app.delete('/wallet/delete/:userId', async (req, res) => {
   try {
     const userId = parseInt(req.params.userId);
-    const success = walletManager.deleteWallet(userId);
+    const success = await walletManager.deleteWallet(userId);
     
     if (success) {
       res.json({ status: 'deleted', message: 'Wallet deleted successfully' });
@@ -207,9 +211,9 @@ app.post('/flashswap/create-transaction', async (req, res) => {
     }
 
     // Get user's Anchor wallet
-    const userWallet = walletManager.getUserAnchorWallet(userId);
+    const userWallet = await walletManager.getUserAnchorWallet(userId);
     if (!userWallet) {
-      res.status(400).json({ error: 'Failed to get user wallet' });
+      res.status(400).json({ error: 'User wallet not found' });
       return;
     }
     
@@ -226,7 +230,7 @@ app.post('/flashswap/create-transaction', async (req, res) => {
 
     // Create the transaction for user to sign
     const transactionData = {
-      transaction: result.transaction.serialize().toString('base64'),
+      transaction: Buffer.from(result.transaction.serialize()).toString('base64'),
       message: `Your embedded wallet will sign this transaction automatically.\n\nTransaction includes:\n- Flash loan from Solend\n- Token swap via Jupiter\n- Flash loan repayment\n\nThis transaction will be signed and executed automatically.`,
       recentBlockhash: latestBlockhash.blockhash,
       quote: result.quote,
@@ -291,7 +295,7 @@ app.get('/flashswap/quote', async (req, res) => {
     }
 
     // Get user's Anchor wallet
-    const userWallet = walletManager.getUserAnchorWallet(parseInt(userId as string));
+    const userWallet = await walletManager.getUserAnchorWallet(parseInt(userId as string));
     if (!userWallet) {
       res.status(400).json({ error: 'User wallet not found' });
       return;
@@ -442,18 +446,20 @@ app.get('/tokens/new/recent', (req, res) => {
 });
 
 // --- Health Check ---
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
+  const wallets = await walletManager.getAllWallets();
   res.json({ 
     status: 'healthy', 
     timestamp: new Date().toISOString(),
-    connectedUsers: walletManager.getAllWallets().length
+    connectedUsers: wallets.length
   });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
+  const wallets = await walletManager.getAllWallets();
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📊 Connected users: ${walletManager.getAllWallets().length}`);
+  console.log(`📊 Connected users: ${wallets.length}`);
 });
 
 export { app, walletManager }; 

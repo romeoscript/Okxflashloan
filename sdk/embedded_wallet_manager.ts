@@ -3,6 +3,7 @@ import { Wallet } from '@coral-xyz/anchor';
 import * as bip39 from 'bip39';
 import { derivePath } from 'ed25519-hd-key';
 import bs58 from 'bs58';
+import { DatabaseManager } from './database_manager';
 
 // Embedded wallet session interface
 export interface EmbeddedWalletSession {
@@ -22,12 +23,13 @@ export interface WalletGenerationOptions {
 }
 
 export class EmbeddedWalletManager {
-  private userWallets: Map<number, EmbeddedWalletSession> = new Map();
   private connection: Connection;
   private encryptionKey: string;
+  private database: DatabaseManager;
 
-  constructor(connection: Connection, encryptionKey?: string) {
+  constructor(connection: Connection, database: DatabaseManager, encryptionKey?: string) {
     this.connection = connection;
+    this.database = database;
     this.encryptionKey = encryptionKey || process.env.WALLET_ENCRYPTION_KEY || 'default-key-change-in-production';
   }
 
@@ -42,7 +44,7 @@ export class EmbeddedWalletManager {
   }> {
     try {
       // Check if user already has a wallet
-      const existingWallet = this.userWallets.get(userId);
+      const existingWallet = await this.database.getWallet(userId);
       if (existingWallet) {
         throw new Error('You already have a wallet. Each user can only create one wallet. Use /walletinfo to view your existing wallet or /exportwallet to export it.');
       }
@@ -59,19 +61,13 @@ export class EmbeddedWalletManager {
       const encryptedPrivateKey = this.encryptData(keypair.secretKey.toString());
       const encryptedMnemonic = this.encryptData(mnemonic);
 
-      // Create wallet session
-      const walletSession: EmbeddedWalletSession = {
+      // Store wallet in database
+      await this.database.createWallet(
         userId,
-        walletPublicKey: keypair.publicKey.toString(),
-        walletPrivateKey: encryptedPrivateKey,
-        mnemonic: encryptedMnemonic,
-        connectedAt: new Date(),
-        lastActivity: new Date(),
-        isActive: true
-      };
-
-      // Store the wallet
-      this.userWallets.set(userId, walletSession);
+        keypair.publicKey.toString(),
+        encryptedPrivateKey,
+        encryptedMnemonic
+      );
 
       // Create welcome message
       const message = this.createWalletWelcomeMessage(keypair.publicKey.toString(), mnemonic);
@@ -91,20 +87,34 @@ export class EmbeddedWalletManager {
   /**
    * Get user's wallet
    */
-  getUserWallet(userId: number): EmbeddedWalletSession | null {
-    const session = this.userWallets.get(userId);
-    if (session && session.isActive) {
-      session.lastActivity = new Date();
-      return session;
+  async getUserWallet(userId: number): Promise<EmbeddedWalletSession | null> {
+    try {
+      const walletData = await this.database.getWallet(userId);
+      if (!walletData) return null;
+
+      // Update activity
+      await this.database.updateWalletActivity(userId);
+
+      return {
+        userId: walletData.userId,
+        walletPublicKey: walletData.publicKey,
+        walletPrivateKey: walletData.encryptedPrivateKey,
+        mnemonic: walletData.encryptedMnemonic,
+        connectedAt: new Date(walletData.createdAt),
+        lastActivity: new Date(walletData.lastActivity),
+        isActive: walletData.isActive
+      };
+    } catch (error) {
+      console.error('Error getting user wallet:', error);
+      return null;
     }
-    return null;
   }
 
   /**
    * Get user's wallet as a Solana Keypair
    */
-  getUserKeypair(userId: number): Keypair | null {
-    const session = this.getUserWallet(userId);
+  async getUserKeypair(userId: number): Promise<Keypair | null> {
+    const session = await this.getUserWallet(userId);
     if (!session) return null;
 
     try {
@@ -120,8 +130,8 @@ export class EmbeddedWalletManager {
   /**
    * Get user's wallet as an Anchor Wallet
    */
-  getUserAnchorWallet(userId: number): Wallet | null {
-    const keypair = this.getUserKeypair(userId);
+  async getUserAnchorWallet(userId: number): Promise<Wallet | null> {
+    const keypair = await this.getUserKeypair(userId);
     if (!keypair) return null;
 
     return {
@@ -141,22 +151,22 @@ export class EmbeddedWalletManager {
   /**
    * Check if user has a wallet
    */
-  hasWallet(userId: number): boolean {
-    const session = this.userWallets.get(userId);
-    return session?.isActive === true;
+  async hasWallet(userId: number): Promise<boolean> {
+    const wallet = await this.database.getWallet(userId);
+    return wallet?.isActive === true;
   }
 
   /**
    * Get wallet balance
    */
   async getWalletBalance(userId: number): Promise<number> {
-    const session = this.getUserWallet(userId);
-    if (!session) {
+    const wallet = await this.database.getWallet(userId);
+    if (!wallet) {
       throw new Error('User wallet not found');
     }
 
     try {
-      const publicKey = new PublicKey(session.walletPublicKey);
+      const publicKey = new PublicKey(wallet.publicKey);
       const balance = await this.connection.getBalance(publicKey);
       return balance / 1e9; // Convert lamports to SOL
     } catch (error) {
@@ -168,25 +178,25 @@ export class EmbeddedWalletManager {
   /**
    * Get wallet info (public only)
    */
-  getWalletInfo(userId: number): { publicKey: string; balance?: number; connectedAt: Date } | null {
-    const session = this.getUserWallet(userId);
-    if (!session) return null;
+  async getWalletInfo(userId: number): Promise<{ publicKey: string; balance?: number; connectedAt: Date } | null> {
+    const wallet = await this.database.getWallet(userId);
+    if (!wallet) return null;
 
     return {
-      publicKey: session.walletPublicKey,
-      connectedAt: session.connectedAt
+      publicKey: wallet.publicKey,
+      connectedAt: new Date(wallet.createdAt)
     };
   }
 
   /**
    * Backup wallet (get mnemonic)
    */
-  backupWallet(userId: number): string | null {
-    const session = this.getUserWallet(userId);
-    if (!session) return null;
+  async backupWallet(userId: number): Promise<string | null> {
+    const wallet = await this.database.getWallet(userId);
+    if (!wallet) return null;
 
     try {
-      return this.decryptData(session.mnemonic);
+      return this.decryptData(wallet.encryptedMnemonic);
     } catch (error) {
       console.error('Error backing up wallet:', error);
       return null;
@@ -194,29 +204,88 @@ export class EmbeddedWalletManager {
   }
 
   /**
+   * Export wallet private key
+   */
+  async exportPrivateKey(userId: number): Promise<string | null> {
+    const wallet = await this.database.getWallet(userId);
+    if (!wallet) return null;
+
+    try {
+      const decryptedPrivateKey = this.decryptData(wallet.encryptedPrivateKey);
+      const privateKeyBytes = new Uint8Array(decryptedPrivateKey.split(',').map(Number));
+      return bs58.encode(privateKeyBytes);
+    } catch (error) {
+      console.error('Error exporting private key:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Export wallet in multiple formats
+   */
+  async exportWallet(userId: number): Promise<{
+    publicKey: string;
+    privateKey: string;
+    mnemonic: string;
+    message: string;
+  } | null> {
+    const wallet = await this.database.getWallet(userId);
+    if (!wallet) return null;
+
+    try {
+      const mnemonic = this.decryptData(wallet.encryptedMnemonic);
+      const privateKey = await this.exportPrivateKey(userId);
+      
+      if (!privateKey) {
+        throw new Error('Failed to export private key');
+      }
+
+      const message = this.createWalletExportMessage(wallet.publicKey, privateKey, mnemonic);
+
+      return {
+        publicKey: wallet.publicKey,
+        privateKey,
+        mnemonic,
+        message
+      };
+    } catch (error) {
+      console.error('Error exporting wallet:', error);
+      return null;
+    }
+  }
+
+  /**
    * Delete user's wallet
    */
-  deleteWallet(userId: number): boolean {
-    const deleted = this.userWallets.delete(userId);
-    return deleted;
+  async deleteWallet(userId: number): Promise<boolean> {
+    return await this.database.deleteWallet(userId);
   }
 
   /**
    * Get all user wallets
    */
-  getAllWallets(): EmbeddedWalletSession[] {
-    return Array.from(this.userWallets.values()).filter(session => session.isActive);
+  async getAllWallets(): Promise<EmbeddedWalletSession[]> {
+    const wallets = await this.database.getAllWallets();
+    return wallets.map(wallet => ({
+      userId: wallet.userId,
+      walletPublicKey: wallet.publicKey,
+      walletPrivateKey: wallet.encryptedPrivateKey,
+      mnemonic: wallet.encryptedMnemonic,
+      connectedAt: new Date(wallet.createdAt),
+      lastActivity: new Date(wallet.lastActivity),
+      isActive: wallet.isActive
+    }));
   }
 
   /**
    * Create transaction for user to sign
    */
-  createTransactionForUser(
+  async createTransactionForUser(
     userId: number,
     instructions: any[],
     recentBlockhash: string
-  ): { transaction: VersionedTransaction; message: string } | null {
-    const keypair = this.getUserKeypair(userId);
+  ): Promise<{ transaction: VersionedTransaction; message: string } | null> {
+    const keypair = await this.getUserKeypair(userId);
     if (!keypair) return null;
 
     try {
@@ -256,7 +325,7 @@ Wallet: ${keypair.publicKey.toString()}
     userId: number,
     transaction: VersionedTransaction
   ): Promise<string> {
-    const keypair = this.getUserKeypair(userId);
+    const keypair = await this.getUserKeypair(userId);
     if (!keypair) {
       throw new Error('User wallet not found');
     }
@@ -332,71 +401,6 @@ Wallet: ${keypair.publicKey.toString()}
   }
 
   /**
-   * Clean up old wallets
-   */
-  cleanupOldWallets(maxAgeHours: number = 24): void {
-    const now = new Date();
-    const maxAge = maxAgeHours * 60 * 60 * 1000; // Convert to milliseconds
-    
-    for (const [userId, session] of this.userWallets.entries()) {
-      if (now.getTime() - session.lastActivity.getTime() > maxAge) {
-        this.userWallets.delete(userId);
-      }
-    }
-  }
-
-  /**
-   * Export wallet private key
-   */
-  exportPrivateKey(userId: number): string | null {
-    const session = this.getUserWallet(userId);
-    if (!session) return null;
-
-    try {
-      const decryptedPrivateKey = this.decryptData(session.walletPrivateKey);
-      const privateKeyBytes = new Uint8Array(decryptedPrivateKey.split(',').map(Number));
-      return bs58.encode(privateKeyBytes);
-    } catch (error) {
-      console.error('Error exporting private key:', error);
-      return null;
-    }
-  }
-
-  /**
-   * Export wallet in multiple formats
-   */
-  exportWallet(userId: number): {
-    publicKey: string;
-    privateKey: string;
-    mnemonic: string;
-    message: string;
-  } | null {
-    const session = this.getUserWallet(userId);
-    if (!session) return null;
-
-    try {
-      const mnemonic = this.decryptData(session.mnemonic);
-      const privateKey = this.exportPrivateKey(userId);
-      
-      if (!privateKey) {
-        throw new Error('Failed to export private key');
-      }
-
-      const message = this.createWalletExportMessage(session.walletPublicKey, privateKey, mnemonic);
-
-      return {
-        publicKey: session.walletPublicKey,
-        privateKey,
-        mnemonic,
-        message
-      };
-    } catch (error) {
-      console.error('Error exporting wallet:', error);
-      return null;
-    }
-  }
-
-  /**
    * Create export message for wallet
    */
   private createWalletExportMessage(publicKey: string, privateKey: string, mnemonic: string): string {
@@ -432,5 +436,14 @@ Wallet: ${keypair.publicKey.toString()}
 • Hardware wallets (Ledger, Trezor)
 • Any Solana wallet supporting private key import
     `;
+  }
+
+  /**
+   * Clean up old wallets
+   */
+  async cleanupOldWallets(maxAgeHours: number = 24): Promise<void> {
+    // This would be implemented with database queries
+    // For now, we'll rely on the database to handle this
+    console.log('Cleanup handled by database');
   }
 } 
