@@ -1,11 +1,12 @@
 import express from 'express';
 import { LaunchDetector } from './sdk/launch_detector';
 import { buildSimulatedFlashLoanInstructions } from './sdk/flash_swap';
-import { Connection, PublicKey, Keypair } from '@solana/web3.js';
+import { Connection, PublicKey, Keypair, VersionedTransaction } from '@solana/web3.js';
 import dotenv from 'dotenv';
 import { Wallet } from '@coral-xyz/anchor';
 import bs58 from 'bs58';
 import { monitorNewTokens, NewTokenData } from './src/monitorNewTokens';
+import { WalletManager } from './sdk/wallet_manager';
 import fs from 'fs';
 import path from 'path';
 
@@ -17,10 +18,85 @@ app.use(express.json());
 // Initialize Solana connection and LaunchDetector
 const connection = new Connection(process.env.RPC_ENDPOINT || '', 'confirmed');
 const detector = new LaunchDetector(connection);
+const walletManager = new WalletManager(connection);
 
 // Store new token monitoring state
 let newTokenMonitorCleanup: (() => void) | null = null;
 let isNewTokenMonitoring = false;
+
+// --- Wallet Management Endpoints ---
+
+// POST /wallet/connect
+// Body: { userId: number, walletPublicKey: string, signature?: string, message?: string }
+app.post('/wallet/connect', async (req, res) => {
+  try {
+    const { userId, walletPublicKey, signature, message } = req.body;
+    
+    if (!userId || !walletPublicKey) {
+      res.status(400).json({ error: 'Missing required parameters' });
+      return;
+    }
+
+    const success = await walletManager.verifyWalletConnection(
+      userId,
+      walletPublicKey,
+      signature || '',
+      message || walletManager.generateChallengeMessage(userId)
+    );
+
+    if (success) {
+      res.json({ 
+        status: 'connected',
+        walletPublicKey,
+        message: 'Wallet connected successfully'
+      });
+    } else {
+      res.status(400).json({ error: 'Failed to verify wallet connection' });
+    }
+  } catch (err) {
+    console.error('Wallet connection error:', err);
+    res.status(500).json({ error: 'Failed to connect wallet', details: err instanceof Error ? err.message : err });
+  }
+});
+
+// GET /wallet/status/:userId
+app.get('/wallet/status/:userId', (req, res) => {
+  try {
+    const userId = parseInt(req.params.userId);
+    const session = walletManager.getUserWallet(userId);
+    
+    if (session) {
+      res.json({
+        connected: true,
+        walletPublicKey: session.walletPublicKey,
+        connectedAt: session.connectedAt,
+        lastActivity: session.lastActivity
+      });
+    } else {
+      res.json({ connected: false });
+    }
+  } catch (err) {
+    console.error('Wallet status error:', err);
+    res.status(500).json({ error: 'Failed to get wallet status' });
+  }
+});
+
+// DELETE /wallet/disconnect/:userId
+app.delete('/wallet/disconnect/:userId', (req, res) => {
+  try {
+    const userId = parseInt(req.params.userId);
+    const success = walletManager.disconnectWallet(userId);
+    
+    if (success) {
+      res.json({ status: 'disconnected', message: 'Wallet disconnected successfully' });
+    } else {
+      res.status(404).json({ error: 'No wallet connected for this user' });
+    }
+  } catch (err) {
+    console.error('Wallet disconnect error:', err);
+    res.status(500).json({ error: 'Failed to disconnect wallet' });
+  }
+});
 
 // --- LaunchDetector Endpoints ---
 
@@ -62,63 +138,94 @@ app.get('/positions', (req, res) => {
   }
 });
 
-// --- FlashSwap Endpoints ---
+// --- FlashSwap Endpoints (Non-Custodial) ---
 
-// POST /flashswap/execute
-// Body: { targetTokenMint: string, desiredTargetAmount: string, slippageBps?: number, walletPrivateKey: string }
-app.post('/flashswap/execute', async (req, res) => {
+// POST /flashswap/create-transaction
+// Body: { targetTokenMint: string, desiredTargetAmount: string, slippageBps?: number, userId: number }
+app.post('/flashswap/create-transaction', async (req, res) => {
   try {
-    const { targetTokenMint, desiredTargetAmount, slippageBps = 100, walletPrivateKey } = req.body;
-    if (!targetTokenMint || !desiredTargetAmount || !walletPrivateKey) {
+    const { targetTokenMint, desiredTargetAmount, slippageBps = 100, userId } = req.body;
+    
+    if (!targetTokenMint || !desiredTargetAmount || !userId) {
       res.status(400).json({ error: 'Missing required parameters' });
       return;
     }
 
-    let keypair;
-    try {
-      // Try parsing as JSON first
-      const secretKey = Uint8Array.from(JSON.parse(walletPrivateKey));
-      keypair = Keypair.fromSecretKey(secretKey);
-    } catch (e) {
-      try {
-        // If JSON parsing fails, try base58
-        const secretKey = bs58.decode(walletPrivateKey);
-        keypair = Keypair.fromSecretKey(secretKey);
-      } catch (e2) {
-        throw new Error('Invalid private key format. Must be either JSON array or base58 string');
-      }
+    // Check if user has connected wallet
+    const session = walletManager.getUserWallet(userId);
+    if (!session) {
+      res.status(400).json({ error: 'User wallet not connected' });
+      return;
     }
 
-    const wallet = new Wallet(keypair);
+    // Create a dummy wallet for transaction building
+    const dummyWallet = { publicKey: new PublicKey(session.walletPublicKey) } as Wallet;
+    
     const result = await buildSimulatedFlashLoanInstructions({
       targetTokenMint: new PublicKey(targetTokenMint),
       desiredTargetAmount,
       slippageBps,
       connection,
-      wallet
+      wallet: dummyWallet
     });
 
-    // Sign the transaction with the keypair
-    result.transaction.sign([keypair]);
+    // Get the latest blockhash
+    const latestBlockhash = await connection.getLatestBlockhash('finalized');
 
-    // Send the transaction to the network
-    const serializedTx = Buffer.from(result.transaction.serialize());
-    const signature = await connection.sendRawTransaction(serializedTx, { skipPreflight: false });
-    const explorerUrl = `https://solscan.io/tx/${signature}`;
-
-    res.json({
-      signature,
-      explorerUrl,
+    // Create the transaction for user to sign
+    const transactionData = {
+      transaction: result.transaction.serialize().toString('base64'),
+      message: `Please sign this transaction to execute the flash loan.\n\nTransaction includes:\n- Flash loan from Solend\n- Token swap via Jupiter\n- Flash loan repayment\n\nThis transaction will be executed on your behalf using your connected wallet.`,
+      recentBlockhash: latestBlockhash.blockhash,
       quote: result.quote,
       estimatedOutput: result.estimatedOutput,
       priceImpact: result.priceImpact,
       route: result.route,
       borrowedAmount: result.borrowedAmount,
       addresses: result.addresses
+    };
+
+    res.json(transactionData);
+  } catch (err) {
+    console.error('FlashSwap create transaction error:', err);
+    res.status(500).json({ error: 'Failed to create flash swap transaction', details: err instanceof Error ? err.message : err });
+  }
+});
+
+// POST /flashswap/execute-signed
+// Body: { userId: number, signedTransaction: string }
+app.post('/flashswap/execute-signed', async (req, res) => {
+  try {
+    const { userId, signedTransaction } = req.body;
+    
+    if (!userId || !signedTransaction) {
+      res.status(400).json({ error: 'Missing required parameters' });
+      return;
+    }
+
+    // Check if user has connected wallet
+    const session = walletManager.getUserWallet(userId);
+    if (!session) {
+      res.status(400).json({ error: 'User wallet not connected' });
+      return;
+    }
+
+    // Deserialize the signed transaction
+    const transactionBuffer = Buffer.from(signedTransaction, 'base64');
+    const transaction = VersionedTransaction.deserialize(transactionBuffer);
+
+    // Execute the signed transaction
+    const signature = await walletManager.executeSignedTransaction(userId, transaction);
+    const explorerUrl = `https://solscan.io/tx/${signature}`;
+
+    res.json({
+      signature,
+      explorerUrl,
+      message: 'Flash swap executed successfully'
     });
   } catch (err) {
-    console.error('FlashSwap execute error:', err);
-    res.status(500).json({ error: 'Failed to execute flash swap', details: err instanceof Error ? err.message : err });
+    console.error('FlashSwap execute signed error:', err);
+    res.status(500).json({ error: 'Failed to execute signed transaction', details: err instanceof Error ? err.message : err });
   }
 });
 
@@ -275,8 +382,19 @@ app.get('/tokens/new/recent', (req, res) => {
   }
 });
 
-// --- Start Server ---
+// --- Health Check ---
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'healthy', 
+    timestamp: new Date().toISOString(),
+    connectedUsers: walletManager.getConnectedUsers().length
+  });
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`API server running on port ${PORT}`);
-}); 
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📊 Connected users: ${walletManager.getConnectedUsers().length}`);
+});
+
+export { app, walletManager }; 

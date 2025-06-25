@@ -1,7 +1,8 @@
 import TelegramBot from 'node-telegram-bot-api';
 import axios from 'axios';
-import { Connection, Keypair } from '@solana/web3.js';
+import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
+import { WalletManager, UserWalletSession } from './wallet_manager';
 
 // Bot configuration interface
 interface BotConfig {
@@ -51,6 +52,7 @@ export class SnipingBot {
     private positionSizingConfig: PositionSizingConfig;
     private authorizedUsers: Set<number>;
     private apiBaseUrl: string;
+    private walletManager: WalletManager;
     private readonly welcomeMessage = `
 🚀 *Welcome to the Flash Arbitrage Bot!*
 
@@ -68,12 +70,19 @@ I'm your automated flash arbitrage assistant for Solana tokens. Here's what I ca
 • Automatic execution when targets are met
 • Rich Telegram interface
 
+🔐 *Non-Custodial Security*
+• Connect your own wallet (Phantom, Solflare, etc.)
+• You control your private keys
+• Bot never holds your funds
+• Sign transactions yourself
+
 _Use the buttons below to control the bot:_
 `;
 
-    constructor(token: string, authorizedUserIds: number[], apiBaseUrl: string = 'http://localhost:3000') {
+    constructor(token: string, authorizedUserIds: number[], connection: Connection, apiBaseUrl: string = 'http://localhost:3000') {
         this.bot = new TelegramBot(token, { polling: true });
         this.authorizedUserIds = authorizedUserIds;
+        this.walletManager = new WalletManager(connection);
         this.config = {
             minLiquidity: 10000,    // $10k minimum liquidity
             maxSlippage: 0.01,      // 1% max slippage
@@ -98,8 +107,12 @@ _Use the buttons below to control the bot:_
         return {
             inline_keyboard: [
                 [
-                    { text: '📊 Status', callback_data: 'status' },
-                    { text: '💰 Positions', callback_data: 'positions' }
+                    { text: '🔐 Connect Wallet', callback_data: 'connect_wallet' },
+                    { text: '📊 Status', callback_data: 'status' }
+                ],
+                [
+                    { text: '💰 Flash Quote', callback_data: 'flash_quote' },
+                    { text: '⚡ Flash Swap', callback_data: 'flash_swap' }
                 ],
                 [
                     { text: '🆕 Recent Tokens', callback_data: 'recent_tokens' },
@@ -112,6 +125,21 @@ _Use the buttons below to control the bot:_
                 [
                     { text: '▶️ Start Monitoring', callback_data: 'start_monitoring' },
                     { text: '⏹ Stop Monitoring', callback_data: 'stop_monitoring' }
+                ]
+            ]
+        };
+    }
+
+    private getWalletKeyboard(): TelegramBot.InlineKeyboardMarkup {
+        return {
+            inline_keyboard: [
+                [
+                    { text: '🔗 Connect New Wallet', callback_data: 'connect_new_wallet' },
+                    { text: '❌ Disconnect Wallet', callback_data: 'disconnect_wallet' }
+                ],
+                [
+                    { text: '👛 Wallet Info', callback_data: 'wallet_info' },
+                    { text: '🔙 Back to Menu', callback_data: 'main_menu' }
                 ]
             ]
         };
@@ -154,6 +182,33 @@ _Use the buttons below to control the bot:_
             });
         });
 
+        // Wallet connection command
+        this.bot.onText(/\/connect/, async (msg) => {
+            if (!this.isAuthorized(msg.from?.id)) {
+                await this.sendUnauthorizedMessage(msg.chat.id);
+                return;
+            }
+
+            await this.handleWalletConnection(msg.chat.id, msg.from!.id);
+        });
+
+        // Flash quote command
+        this.bot.onText(/\/flashquote (.+)/, async (msg, match) => {
+            if (!this.isAuthorized(msg.from?.id)) {
+                await this.sendUnauthorizedMessage(msg.chat.id);
+                return;
+            }
+
+            if (!this.walletManager.isWalletConnected(msg.from!.id)) {
+                await this.bot.sendMessage(msg.chat.id, 
+                    '❌ Please connect your wallet first using /connect or the "Connect Wallet" button.');
+                return;
+            }
+
+            const tokenMint = match![1];
+            await this.handleFlashQuoteCommand(msg.chat.id, tokenMint, "1"); // Default 1 SOL
+        });
+
         // Handle callback queries (button clicks)
         this.bot.on('callback_query', async (callbackQuery) => {
             if (!callbackQuery.message || !this.isAuthorized(callbackQuery.from.id)) {
@@ -168,11 +223,26 @@ _Use the buttons below to control the bot:_
             const action = callbackQuery.data;
 
             switch (action) {
+                case 'connect_wallet':
+                    await this.handleWalletConnection(chatId, callbackQuery.from.id);
+                    break;
+                case 'connect_new_wallet':
+                    await this.handleWalletConnection(chatId, callbackQuery.from.id);
+                    break;
+                case 'disconnect_wallet':
+                    await this.handleWalletDisconnection(chatId, callbackQuery.from.id);
+                    break;
+                case 'wallet_info':
+                    await this.handleWalletInfo(chatId, callbackQuery.from.id);
+                    break;
+                case 'flash_quote':
+                    await this.handleFlashQuoteMenu(chatId, callbackQuery.from.id);
+                    break;
+                case 'flash_swap':
+                    await this.handleFlashSwapMenu(chatId, callbackQuery.from.id);
+                    break;
                 case 'status':
                     await this.handleStatusCommand(chatId);
-                    break;
-                case 'positions':
-                    await this.handlePositionsCommand(chatId);
                     break;
                 case 'config':
                     await this.handleConfigCommand(chatId);
@@ -199,483 +269,282 @@ _Use the buttons below to control the bot:_
                         chat_id: chatId,
                         message_id: callbackQuery.message.message_id,
                         parse_mode: 'Markdown',
+                        disable_web_page_preview: true,
                         reply_markup: this.getMainMenuKeyboard()
                     });
                     break;
                 default:
-                    if (action?.startsWith('set_')) {
-                        const param = action.replace('set_', '');
-                        await this.handleConfigUpdate(chatId, param);
-                    }
+                    await this.bot.answerCallbackQuery(callbackQuery.id, {
+                        text: 'Unknown action',
+                        show_alert: true
+                    });
             }
 
-            // Answer callback query to remove loading state
             await this.bot.answerCallbackQuery(callbackQuery.id);
         });
 
-        // Status command with detailed information
-        this.bot.onText(/\/status/, async (msg) => {
-            if (!this.isAuthorized(msg.from?.id)) {
-                await this.sendUnauthorizedMessage(msg.chat.id);
-                return;
+        // Handle text messages for wallet connection
+        this.bot.on('message', async (msg) => {
+            if (!msg.text || !this.isAuthorized(msg.from?.id)) return;
+
+            const chatId = msg.chat.id;
+            const userId = msg.from!.id;
+
+            // Check if user is in wallet connection mode
+            if (msg.text.startsWith('wallet:')) {
+                await this.handleWalletPublicKey(chatId, userId, msg.text.substring(7).trim());
             }
-
-            const positions = this.getActivePositions();
-            const totalPnL = positions.reduce((sum, pos) => sum + (pos.currentPnL || 0), 0);
-            const activePositions = positions.length;
-
-            const statusMessage = `
-📊 *Bot Status Report*
-
-🟢 *System Status*
-• Bot: Active
-• Token Monitoring: Running via API
-• Last Update: ${new Date().toLocaleString()}
-
-💰 *Flash Arbitrage Summary*
-• Active Positions: ${activePositions}
-• Total PnL: $${totalPnL.toFixed(2)}
-• Total Trades: ${this.getTotalTrades()}
-
-⚙️ *Current Settings*
-• Min Liquidity: $${this.config.minLiquidity.toLocaleString()}
-• Max Slippage: ${(this.config.maxSlippage * 100).toFixed(1)}%
-• Target Profit: ${(this.config.targetProfitPercentage * 100).toFixed(1)}%
-• Max Gas: ${(this.config.maxGasPrice / 1e9).toFixed(3)} SOL
-
-📈 *Position Sizing*
-• Max Size: $${this.positionSizingConfig.maxPositionSize.toLocaleString()}
-• Min Liquidity Ratio: ${this.positionSizingConfig.minLiquidityRatio}x
-• Max Risk/Trade: $${this.positionSizingConfig.maxRiskPerTrade.toLocaleString()}
-• Min Profit Threshold: ${(this.positionSizingConfig.minProfitThreshold * 100).toFixed(1)}%
-
-_Use /recent to view detected tokens._
-`;
-
-            await this.bot.sendMessage(msg.chat.id, statusMessage, {
-                parse_mode: 'Markdown',
-                disable_web_page_preview: true
-            });
         });
+    }
 
-        // Positions command with detailed position information
-        this.bot.onText(/\/positions/, async (msg) => {
-            if (!this.isAuthorized(msg.from?.id)) {
-                await this.sendUnauthorizedMessage(msg.chat.id);
-                return;
-            }
+    private async handleWalletConnection(chatId: number, userId: number) {
+        const isConnected = this.walletManager.isWalletConnected(userId);
+        
+        if (isConnected) {
+            const session = this.walletManager.getUserWallet(userId);
+            const message = `
+🔐 *Wallet Connected*
 
-            const positions = this.getActivePositions();
-            if (positions.length === 0) {
-                await this.bot.sendMessage(msg.chat.id, '📊 No active positions at the moment. Use /recent to view detected tokens.', {
+👛 *Wallet Address:* \`${session!.walletPublicKey}\`
+🕐 *Connected:* ${session!.connectedAt.toLocaleString()}
+⏰ *Last Activity:* ${session!.lastActivity.toLocaleString()}
+
+_Your wallet is ready for flash loans and swaps!_
+            `;
+            
+            await this.bot.sendMessage(chatId, message, {
+                parse_mode: 'Markdown',
+                reply_markup: this.getWalletKeyboard()
+            });
+        } else {
+            const message = `
+🔐 *Connect Your Wallet*
+
+To use flash loans and swaps, you need to connect your Solana wallet.
+
+**Supported Wallets:**
+• Phantom
+• Solflare
+• Sollet
+• Any wallet that supports Solana
+
+**How to connect:**
+1. Copy your wallet's public key
+2. Send it in this format: \`wallet:YOUR_PUBLIC_KEY\`
+
+**Example:**
+\`wallet:7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU\`
+
+⚠️ *Security Note: Only send your public key, never your private key!*
+            `;
+            
+            await this.bot.sendMessage(chatId, message, {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔙 Back to Menu', callback_data: 'main_menu' }]
+                    ]
+                }
+            });
+        }
+    }
+
+    private async handleWalletPublicKey(chatId: number, userId: number, publicKey: string) {
+        try {
+            // Validate the public key
+            new PublicKey(publicKey);
+            
+            // For now, we'll accept the connection without signature verification
+            // In production, you should implement proper signature verification
+            const success = await this.walletManager.verifyWalletConnection(
+                userId,
+                publicKey,
+                '', // No signature for now
+                this.walletManager.generateChallengeMessage(userId)
+            );
+            
+            if (success) {
+                const message = `
+✅ *Wallet Connected Successfully!*
+
+👛 *Wallet Address:* \`${publicKey}\`
+🕐 *Connected:* ${new Date().toLocaleString()}
+
+_Your wallet is now ready for flash loans and swaps!_
+
+**Next Steps:**
+• Use /flashquote TOKEN_MINT to get a quote
+• Use the "Flash Quote" button to get started
+                `;
+                
+                await this.bot.sendMessage(chatId, message, {
+                    parse_mode: 'Markdown',
                     reply_markup: this.getMainMenuKeyboard()
                 });
-                return;
+            } else {
+                await this.bot.sendMessage(chatId, '❌ Failed to connect wallet. Please try again.');
             }
+        } catch (error) {
+            await this.bot.sendMessage(chatId, '❌ Invalid wallet address. Please check and try again.');
+        }
+    }
 
-            const positionsMessage = positions.map((pos, index) => {
-                const pnlColor = (pos.currentPnL || 0) >= 0 ? '🟢' : '🔴';
-                const pnlPercentage = ((pos.currentPnL || 0) / pos.positionSize * 100).toFixed(2);
-                
-                return `
-*Position ${index + 1}*
-${pnlColor} *Token:* \`${pos.tokenAddress.toString()}\`
-💰 *Size:* $${pos.positionSize.toLocaleString()}
-📈 *Entry:* $${pos.entryPrice.toFixed(6)}
-📊 *Current:* $${pos.currentPrice?.toFixed(6) || 'N/A'}
-💵 *PnL:* $${(pos.currentPnL || 0).toFixed(2)} (${pnlPercentage}%)
-⏱ *Time:* ${new Date(pos.entryTime).toLocaleString()}
-🎯 *Target:* ${(pos.autoSellConfig.profitTarget * 100).toFixed(1)}%
-🛑 *Stop Loss:* ${(pos.autoSellConfig.stopLoss * 100).toFixed(1)}%
-`;
-            }).join('\n');
-
-            const summaryMessage = `
-📊 *Active Positions Summary*
-${positionsMessage}
-
-_Total PnL: $${positions.reduce((sum, pos) => sum + (pos.currentPnL || 0), 0).toFixed(2)}_
-
-_Use the buttons below to control the bot:_
-`;
-
-            await this.bot.sendMessage(msg.chat.id, summaryMessage, {
-                parse_mode: 'Markdown',
-                disable_web_page_preview: true,
+    private async handleWalletDisconnection(chatId: number, userId: number) {
+        const success = this.walletManager.disconnectWallet(userId);
+        
+        if (success) {
+            await this.bot.sendMessage(chatId, '✅ Wallet disconnected successfully.', {
                 reply_markup: this.getMainMenuKeyboard()
             });
-        });
+        } else {
+            await this.bot.sendMessage(chatId, '❌ No wallet was connected.');
+        }
+    }
 
-        // Config command with formatted settings
-        this.bot.onText(/\/config/, async (msg) => {
-            if (!this.isAuthorized(msg.from?.id)) {
-                await this.sendUnauthorizedMessage(msg.chat.id);
-                return;
-            }
+    private async handleWalletInfo(chatId: number, userId: number) {
+        const session = this.walletManager.getUserWallet(userId);
+        
+        if (session) {
+            const message = `
+👛 *Wallet Information*
 
-            const configMessage = `
-⚙️ *Current Configuration*
+**Address:** \`${session.walletPublicKey}\`
+**Connected:** ${session.connectedAt.toLocaleString()}
+**Last Activity:** ${session.lastActivity.toLocaleString()}
 
-📈 *Trading Parameters*
-• Min Liquidity: $${this.config.minLiquidity.toLocaleString()}
-• Max Slippage: ${(this.config.maxSlippage * 100).toFixed(1)}%
-• Target Profit: ${(this.config.targetProfitPercentage * 100).toFixed(1)}%
-• Max Gas: ${(this.config.maxGasPrice / 1e9).toFixed(3)} SOL
-• DEXes: ${this.config.dexes.join(', ')}
-• Block Window: ${this.config.blockWindow}
-
-💰 *Position Sizing*
-• Max Position Size: $${this.positionSizingConfig.maxPositionSize.toLocaleString()}
-• Min Liquidity Ratio: ${this.positionSizingConfig.minLiquidityRatio}x
-• Volatility Multiplier: ${this.positionSizingConfig.volatilityMultiplier}x
-• Max Risk/Trade: $${this.positionSizingConfig.maxRiskPerTrade.toLocaleString()}
-• Min Profit Threshold: ${(this.positionSizingConfig.minProfitThreshold * 100).toFixed(1)}%
-
-_To update settings, use /setconfig with the following format:_
-\`/setconfig param value\`
-
-_Example: /setconfig minLiquidity 20000_
-`;
-
-            await this.bot.sendMessage(msg.chat.id, configMessage, {
+_Your wallet is connected and ready for transactions._
+            `;
+            
+            await this.bot.sendMessage(chatId, message, {
                 parse_mode: 'Markdown',
-                disable_web_page_preview: true
+                reply_markup: this.getWalletKeyboard()
             });
+        } else {
+            await this.bot.sendMessage(chatId, '❌ No wallet connected. Please connect a wallet first.');
+        }
+    }
+
+    private async handleFlashQuoteMenu(chatId: number, userId: number) {
+        if (!this.walletManager.isWalletConnected(userId)) {
+            await this.bot.sendMessage(chatId, 
+                '❌ Please connect your wallet first using the "Connect Wallet" button.');
+            return;
+        }
+
+        const message = `
+💰 *Flash Quote*
+
+To get a flash loan quote, send a message with the token mint address.
+
+**Format:** \`/flashquote TOKEN_MINT\`
+
+**Example:** \`/flashquote DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263\`
+
+**Or send just the token mint address:**
+\`DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263\`
+
+_The default amount is 1 SOL. You can specify a custom amount later._
+        `;
+        
+        await this.bot.sendMessage(chatId, message, {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '🔙 Back to Menu', callback_data: 'main_menu' }]
+                ]
+            }
         });
+    }
 
-        // Setconfig command with better formatting
-        this.bot.onText(/\/setconfig (.+)/, async (msg, match) => {
-            if (!this.isAuthorized(msg.from?.id)) {
-                await this.sendUnauthorizedMessage(msg.chat.id);
-                return;
+    private async handleFlashSwapMenu(chatId: number, userId: number) {
+        if (!this.walletManager.isWalletConnected(userId)) {
+            await this.bot.sendMessage(chatId, 
+                '❌ Please connect your wallet first using the "Connect Wallet" button.');
+            return;
+        }
+
+        const message = `
+⚡ *Flash Swap*
+
+To execute a flash swap, first get a quote using /flashquote, then follow the instructions to sign the transaction.
+
+**Steps:**
+1. Get a quote: \`/flashquote TOKEN_MINT\`
+2. Review the quote details
+3. Sign the transaction with your wallet
+4. Execute the flash loan
+
+⚠️ *Make sure you have enough SOL in your wallet for transaction fees!*
+        `;
+        
+        await this.bot.sendMessage(chatId, message, {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '🔙 Back to Menu', callback_data: 'main_menu' }]
+                ]
+            }
+        });
+    }
+
+    private async handleFlashQuoteCommand(chatId: number, tokenMint: string, amount: string) {
+        const statusMsg = await this.bot.sendMessage(chatId, '🔄 Getting flash loan quote...');
+
+        try {
+            const session = this.walletManager.getUserWallet(chatId);
+            if (!session) {
+                throw new Error('Wallet not connected');
             }
 
-            if (!match) {
-                await this.bot.sendMessage(msg.chat.id, 
-                    '❌ Invalid command format. Use: /setconfig param value\n' +
-                    'Example: /setconfig minLiquidity 20000'
-                );
-                return;
-            }
-
-            const [_, param, value] = match[1].match(/(\w+)\s+([\d.]+)/) || [];
-            if (!param || !value) {
-                await this.bot.sendMessage(msg.chat.id, 
-                    '❌ Invalid format. Use: /setconfig param value\n' +
-                    'Example: /setconfig minLiquidity 20000'
-                );
-                return;
-            }
-
-            try {
-                const numValue = parseFloat(value);
-                if (isNaN(numValue)) {
-                    throw new Error('Invalid number');
+            const response = await axios.get(`${this.apiBaseUrl}/flashswap/quote`, {
+                params: {
+                    targetTokenMint: tokenMint,
+                    desiredTargetAmount: amount,
+                    slippageBps: this.config.maxSlippage * 10000,
+                    walletPublicKey: session.walletPublicKey
                 }
+            });
 
-                // Update config based on parameter
-                const oldValue = this.updateConfig(param, numValue);
-                const newValue = this.getConfigValue(param);
+            const result: FlashSwapQuote = response.data;
+            
+            const message = `
+💰 *Flash Loan Quote*
 
-                const updateMessage = `
-✅ *Configuration Updated*
+🎯 **Token:** \`${tokenMint}\`
+💸 **Borrow Amount:** ${amount} SOL
+📊 **Estimated Output:** ${result.estimatedOutput} tokens
+📈 **Price Impact:** ${result.priceImpact}%
+🛣️ **Route:** ${result.route.length} step(s)
 
-*${param}:*
-• Old Value: ${this.formatConfigValue(param, oldValue)}
-• New Value: ${this.formatConfigValue(param, newValue)}
+**Next Steps:**
+1. Review the quote above
+2. If you want to proceed, use the "Execute Flash Swap" button
+3. Sign the transaction with your wallet
+4. The flash loan will be executed
 
-_Use /config to view all settings_
-`;
+⚠️ *This is a simulation. Actual execution may vary due to market conditions.*
+            `;
 
-                await this.bot.sendMessage(msg.chat.id, updateMessage, {
-                    parse_mode: 'Markdown',
-                    disable_web_page_preview: true
-                });
-            } catch (error) {
-                await this.bot.sendMessage(msg.chat.id, 
-                    `❌ Error updating configuration: ${error instanceof Error ? error.message : 'Invalid value'}\n` +
-                    'Use /config to view valid parameters and their current values.'
-                );
-            }
-        });
-
-        // Help command with detailed information
-        this.bot.onText(/\/help/, async (msg) => {
-            if (!this.isAuthorized(msg.from?.id)) {
-                await this.sendUnauthorizedMessage(msg.chat.id);
-                return;
-            }
-
-            const helpMessage = `
-📚 *Bot Command Guide*
-
-*Basic Commands*
-/start - Start the bot and view welcome message
-/status - Check bot status and trading summary
-/positions - View active trading positions
-/config - View current configuration
-/help - Show this help message
-
-*Token Monitoring*
-/recent - View recent tokens for flash arbitrage
-
-*Flash Loan Commands*
-/flashquote <token_mint> <amount> - Get flash swap quote
-/flashswap <token_mint> <amount> - Execute immediate flash swap
-/flasharbitrage <token_mint> <amount> [profit_target%] - Flash arbitrage with profit monitoring
-
-*Flash Arbitrage Examples*
-• \`/flasharbitrage EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 1000\` (3% default)
-• \`/flasharbitrage EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 1000 5\` (5% target)
-
-*Workflow*
-1. Use /recent to see detected tokens
-2. Copy token address from the list
-3. Execute flash arbitrage with desired profit target
-4. Bot monitors price and executes automatically
-
-*Configuration Parameters*
-• minLiquidity - Minimum liquidity in USD
-• maxSlippage - Maximum allowed slippage (0.01 = 1%)
-• targetProfitPercentage - Target profit (0.03 = 3%)
-• maxGasPrice - Maximum gas price in lamports
-• maxPositionSize - Maximum position size in USD
-• minLiquidityRatio - Minimum liquidity ratio
-• volatilityMultiplier - Volatility adjustment factor
-• maxRiskPerTrade - Maximum risk per trade in USD
-• minProfitThreshold - Minimum profit threshold
-
-*Need more help?*
-Contact the bot administrator for additional support.
-
-_Use the buttons below to control the bot:_
-`;
-
-            await this.bot.sendMessage(msg.chat.id, helpMessage, {
+            await this.bot.editMessageText(message, {
+                chat_id: chatId,
+                message_id: statusMsg.message_id,
                 parse_mode: 'Markdown',
-                disable_web_page_preview: true,
-                reply_markup: this.getMainMenuKeyboard()
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '⚡ Execute Flash Swap', callback_data: `execute_swap_${tokenMint}_${amount}` }],
+                        [{ text: '🔙 Back to Menu', callback_data: 'main_menu' }]
+                    ]
+                }
             });
-        });
 
-        // Flashswap Quote command
-        this.bot.onText(/\/quote (.+)/, async (msg, match) => {
-            if (!this.isAuthorized(msg.from?.id)) {
-                await this.sendUnauthorizedMessage(msg.chat.id);
-                return;
-            }
-
-            if (!match) {
-                await this.bot.sendMessage(msg.chat.id, 
-                    '❌ Invalid command format. Use: /quote <token_mint> <amount>');
-                return;
-            }
-
-            try {
-                const args = match[1].split(' ');
-                if (args.length < 2) {
-                    await this.bot.sendMessage(msg.chat.id, 
-                        '❌ Invalid format. Use: /quote <token_mint> <amount>\n' +
-                        'Example: /quote EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 1000');
-                    return;
-                }
-
-                // Get wallet public key from environment
-                const privateKey = process.env.SOLANA_PRIVATE_KEY;
-                if (!privateKey) {
-                    throw new Error('Wallet private key not configured');
-                }
-
-                let keypair: Keypair;
-                try {
-                    // Try parsing as JSON first
-                    const secretKey = Uint8Array.from(JSON.parse(privateKey));
-                    keypair = Keypair.fromSecretKey(secretKey);
-                } catch (e) {
-                    try {
-                        // If JSON parsing fails, try base58
-                        const secretKey = bs58.decode(privateKey);
-                        keypair = Keypair.fromSecretKey(secretKey);
-                    } catch (e2) {
-                        throw new Error('Invalid private key format. Must be either JSON array or base58 string');
-                    }
-                }
-
-                const walletPublicKey = keypair.publicKey.toString();
-
-                const [tokenMint, amount] = args;
-                const quote = await this.getFlashSwapQuote(tokenMint, amount, walletPublicKey);
-
-                const message = `
-💱 *Flash Swap Quote*
-
-📊 *Token Details*
-• Target Token: \`${tokenMint}\`
-• Desired Amount: ${amount}
-
-💰 *Quote Details*
-• Estimated Output: ${quote.estimatedOutput}
-• Price Impact: ${quote.priceImpact}%
-• Borrowed Amount: ${quote.borrowedAmount} lamports
-
-🛣️ *Route*
-• Steps: ${quote.route.length}
-
-_To execute this swap, use:_
-\`/flashswap ${tokenMint} ${amount}\`
-`;
-
-                await this.bot.sendMessage(msg.chat.id, message, {
-                    parse_mode: 'Markdown',
-                    reply_markup: {
-                        inline_keyboard: [[
-                            { text: '🔄 Execute Swap', callback_data: `execute_${tokenMint}_${amount}` }
-                        ]]
-                    }
-                });
-            } catch (error) {
-                console.error('Quote error:', error);
-                await this.bot.sendMessage(msg.chat.id, 
-                    '❌ Failed to get quote: ' + (error instanceof Error ? error.message : 'Unknown error'));
-            }
-        });
-
-        // Flashswap Execute command
-        this.bot.onText(/\/flashswap (.+)/, async (msg, match) => {
-            if (!this.isAuthorized(msg.from?.id)) {
-                await this.sendUnauthorizedMessage(msg.chat.id);
-                return;
-            }
-
-            if (!match) {
-                await this.bot.sendMessage(msg.chat.id, 
-                    '❌ Invalid command format. Use: /flashswap <token_mint> <amount>');
-                return;
-            }
-
-            try {
-                const args = match[1].split(' ');
-                if (args.length < 2) {
-                    await this.bot.sendMessage(msg.chat.id, 
-                        '❌ Invalid format. Use: /flashswap <token_mint> <amount>\n' +
-                        'Example: /flashswap EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 1000');
-                    return;
-                }
-
-                const [tokenMint, amount] = args;
-                await this.executeFlashSwap(tokenMint, amount, msg);
-            } catch (error) {
-                console.error('Flashswap error:', error);
-                await this.bot.sendMessage(msg.chat.id, 
-                    '❌ Failed to execute flash swap: ' + (error instanceof Error ? error.message : 'Unknown error'));
-            }
-        });
-
-        // Flash Arbitrage command - waits for profit target
-        this.bot.onText(/\/flasharbitrage (.+)/, async (msg, match) => {
-            if (!this.isAuthorized(msg.from?.id)) {
-                await this.sendUnauthorizedMessage(msg.chat.id);
-                return;
-            }
-
-            if (!match) {
-                await this.bot.sendMessage(msg.chat.id, 
-                    '❌ Invalid command format. Use: /flasharbitrage <token_mint> <amount> [profit_target%]');
-                return;
-            }
-
-            try {
-                const args = match[1].split(' ');
-                if (args.length < 2) {
-                    await this.bot.sendMessage(msg.chat.id, 
-                        '❌ Invalid format. Use: /flasharbitrage <token_mint> <amount> [profit_target%]\n' +
-                        'Example: /flasharbitrage EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 1000 5\n' +
-                        'Default profit target: 3%');
-                    return;
-                }
-
-                const [tokenMint, amount, profitTargetStr] = args;
-                const profitTarget = profitTargetStr ? parseFloat(profitTargetStr) : 3; // Default 3%
-                
-                if (profitTarget < 0.1 || profitTarget > 50) {
-                    await this.bot.sendMessage(msg.chat.id, 
-                        '❌ Invalid profit target. Must be between 0.1% and 50%');
-                    return;
-                }
-
-                await this.executeFlashArbitrage(tokenMint, amount, profitTarget, msg);
-            } catch (error) {
-                console.error('Flash arbitrage error:', error);
-                await this.bot.sendMessage(msg.chat.id, 
-                    '❌ Failed to execute flash arbitrage: ' + (error instanceof Error ? error.message : 'Unknown error'));
-            }
-        });
-
-        // Recent tokens command - shows recent tokens for flash arbitrage
-        this.bot.onText(/\/recent/, async (msg) => {
-            if (!this.isAuthorized(msg.from?.id)) {
-                await this.sendUnauthorizedMessage(msg.chat.id);
-                return;
-            }
-
-            try {
-                // Get recent tokens from the monitoring API
-                const response = await axios.get(`${this.apiBaseUrl}/tokens/new/recent?limit=10`);
-                const tokens = response.data.tokens || [];
-
-                if (tokens.length === 0) {
-                    await this.bot.sendMessage(msg.chat.id, 
-                        '📊 No recent tokens found. Start monitoring to detect new tokens.');
-                    return;
-                }
-
-                let message = `📊 *Recent Tokens for Flash Arbitrage*\n\n`;
-                
-                tokens.forEach((token: any, index: number) => {
-                    const liquidityUSD = token.quoteInfo.quoteLpAmount * 100; // Rough estimate
-                    const timeAgo = this.getTimeAgo(new Date(token.timestamp));
-                    
-                    message += `*${index + 1}. ${token.baseInfo.baseAddress}*\n`;
-                    message += `💰 Liquidity: ~$${liquidityUSD.toLocaleString()}\n`;
-                    message += `👤 Creator: \`${token.creator}\`\n`;
-                    message += `⏰ ${timeAgo}\n\n`;
-                    message += `*Quick Actions:*\n`;
-                    message += `• \`/flasharbitrage ${token.baseInfo.baseAddress} 1000\` (3%)\n`;
-                    message += `• \`/flasharbitrage ${token.baseInfo.baseAddress} 1000 5\` (5%)\n`;
-                    message += `• \`/flashquote ${token.baseInfo.baseAddress} 1000\` (quote)\n\n`;
-                    
-                    if (index < tokens.length - 1) {
-                        message += '─'.repeat(40) + '\n\n';
-                    }
-                });
-
-                message += `_Click any command above to execute flash arbitrage!_`;
-
-                await this.bot.sendMessage(msg.chat.id, message, {
-                    parse_mode: 'Markdown',
-                    disable_web_page_preview: true
-                });
-
-            } catch (error) {
-                console.error('Recent tokens error:', error);
-                await this.bot.sendMessage(msg.chat.id, 
-                    '❌ Failed to get recent tokens: ' + (error instanceof Error ? error.message : 'Unknown error'));
-            }
-        });
-
-        // Handle callback queries (e.g., Execute Swap button)
-        this.bot.on('callback_query', async (query) => {
-            if (!query.message || !this.isAuthorized(query.from.id)) {
-                await this.bot.answerCallbackQuery(query.id, { text: 'Unauthorized' });
-                return;
-            }
-
-            if (query.data?.startsWith('execute_')) {
-                const [_, tokenMint, amount] = query.data.split('_');
-                await this.executeFlashSwap(tokenMint, amount, query.message);
-                await this.bot.answerCallbackQuery(query.id);
-            }
-        });
+        } catch (error) {
+            const errorMessage = '❌ Failed to get flash swap quote: ' + 
+                (error instanceof Error ? error.message : 'Unknown error');
+            await this.bot.editMessageText(errorMessage, {
+                chat_id: chatId,
+                message_id: statusMsg.message_id
+            });
+        }
     }
 
     private isAuthorized(userId?: number): boolean {
@@ -758,8 +627,7 @@ _Use /recent to view detected tokens._
 
         await this.bot.sendMessage(chatId, statusMessage, {
             parse_mode: 'Markdown',
-            disable_web_page_preview: true,
-            reply_markup: this.getMainMenuKeyboard()
+            disable_web_page_preview: true
         });
     }
 
@@ -782,13 +650,15 @@ _Use /recent to view detected tokens._
 • Max Risk/Trade: $${this.positionSizingConfig.maxRiskPerTrade.toLocaleString()}
 • Min Profit Threshold: ${(this.positionSizingConfig.minProfitThreshold * 100).toFixed(1)}%
 
-_Click a button below to update settings:_
+_To update settings, use /setconfig with the following format:_
+\`/setconfig param value\`
+
+_Example: /setconfig minLiquidity 20000_
 `;
 
         await this.bot.sendMessage(chatId, configMessage, {
             parse_mode: 'Markdown',
-            disable_web_page_preview: true,
-            reply_markup: this.getConfigKeyboard()
+            disable_web_page_preview: true
         });
     }
 
@@ -912,13 +782,18 @@ _Use the buttons below to control the bot:_
 /recent - View recent tokens for flash arbitrage
 
 *Flash Loan Commands*
-/flashquote <token_mint> <amount> - Get flash swap quote
+/flashquote <token_mint> <amount> - Get flash swap quote with fees
 /flashswap <token_mint> <amount> - Execute immediate flash swap
 /flasharbitrage <token_mint> <amount> [profit_target%] - Flash arbitrage with profit monitoring
 
 *Flash Arbitrage Examples*
 • \`/flasharbitrage EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 1000\` (3% default)
 • \`/flasharbitrage EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v 1000 5\` (5% target)
+
+*Flash Loan Costs:*
+• Flash Loan Fee: ~0.000003 SOL (≈ $0.0003)
+• Transaction Fee: ~0.000005 SOL (≈ $0.0005)
+• Total Cost: ~$0.0008 per trade
 
 *Workflow*
 1. Use /recent to see detected tokens
@@ -977,7 +852,7 @@ _Use the buttons below to control the bot:_
                 message += `*Quick Actions:*\n`;
                 message += `• \`/flasharbitrage ${token.baseInfo.baseAddress} 1000\` (3%)\n`;
                 message += `• \`/flasharbitrage ${token.baseInfo.baseAddress} 1000 5\` (5%)\n`;
-                message += `• \`/flashquote ${token.baseInfo.baseAddress} 1000\` (quote)\n\n`;
+                message += `• \`/flashquote ${token.baseInfo.baseAddress} 1000\` (flash quote)\n\n`;
                 
                 if (index < tokens.length - 1) {
                     message += '─'.repeat(40) + '\n\n';
@@ -1013,11 +888,16 @@ Flash arbitrage allows you to borrow funds, buy tokens, and sell them for profit
 3. **Execute** - Borrow WSOL, buy token, sell immediately
 4. **Repay** - Repay loan with profit
 
+*Costs:*
+• Flash Loan Fee: ~0.000003 SOL (≈ $0.0003)
+• Transaction Fee: ~0.000005 SOL (≈ $0.0005)
+• Total Cost: ~$0.0008 per trade
+
 *Commands:*
 • \`/recent\` - View detected tokens
 • \`/flasharbitrage <token> <amount>\` - Wait for 3% profit
 • \`/flasharbitrage <token> <amount> 5\` - Wait for 5% profit
-• \`/flashquote <token> <amount>\` - Get price quote
+• \`/flashquote <token> <amount>\` - Get flash swap quote with fees
 
 *Example Workflow:*
 1. Use \`/recent\` to see new tokens
@@ -1036,239 +916,6 @@ _Use the buttons below to control the bot:_
             disable_web_page_preview: true,
             reply_markup: this.getMainMenuKeyboard()
         });
-    }
-
-    private async getFlashSwapQuote(tokenMint: string, amount: string, walletPublicKey: string): Promise<FlashSwapQuote> {
-        try {
-            const response = await axios.get(`${this.apiBaseUrl}/flashswap/quote`, {
-                params: {
-                    targetTokenMint: tokenMint,
-                    desiredTargetAmount: amount,
-                    slippageBps: this.config.maxSlippage * 10000,
-                    walletPublicKey
-                }
-            });
-            return response.data;
-        } catch (error) {
-            if (axios.isAxiosError(error)) {
-                throw new Error(error.response?.data?.error || error.message);
-            }
-            throw error;
-        }
-    }
-
-    private async executeFlashSwap(tokenMint: string, amount: string, msg: TelegramBot.Message) {
-        const chatId = msg.chat.id;
-        
-        // Send initial status
-        const statusMsg = await this.bot.sendMessage(chatId, '🔄 Preparing flash swap...');
-
-        try {
-            // Get user's wallet from environment or secure storage
-            // Note: In production, you should use a secure wallet management system
-            const privateKey = process.env.SOLANA_PRIVATE_KEY;
-            if (!privateKey) {
-                throw new Error('Wallet private key not configured');
-            }
-
-            let keypair: Keypair;
-            try {
-                // Try parsing as JSON first
-                const secretKey = Uint8Array.from(JSON.parse(privateKey));
-                keypair = Keypair.fromSecretKey(secretKey);
-            } catch (e) {
-                try {
-                    // If JSON parsing fails, try base58
-                    const secretKey = bs58.decode(privateKey);
-                    keypair = Keypair.fromSecretKey(secretKey);
-                } catch (e2) {
-                    throw new Error('Invalid private key format. Must be either JSON array or base58 string');
-                }
-            }
-
-            const walletPublicKey = keypair.publicKey.toString();
-
-            // Execute the flash swap
-            const response = await axios.post(`${this.apiBaseUrl}/flashswap/execute`, {
-                targetTokenMint: tokenMint,
-                desiredTargetAmount: amount,
-                slippageBps: this.config.maxSlippage * 10000,
-                walletPrivateKey: privateKey
-            });
-
-            const result: FlashSwapExecuteResponse = response.data;
-
-            // Update status with success
-            const successMessage = `
-✅ *Flash Swap Executed Successfully*
-
-📊 *Transaction Details*
-• Target Token: \`${tokenMint}\`
-• Amount: ${amount}
-• Estimated Output: ${result.estimatedOutput}
-• Price Impact: ${result.priceImpact}%
-• Borrowed Amount: ${result.borrowedAmount} lamports
-
-🔗 [View Transaction on Solscan](${result.explorerUrl})
-
-_Transaction has been signed and submitted to the network._
-`;
-
-            await this.bot.editMessageText(successMessage, {
-                chat_id: chatId,
-                message_id: statusMsg.message_id,
-                parse_mode: 'Markdown',
-                disable_web_page_preview: false
-            });
-
-        } catch (error) {
-            // Update status with error
-            const errorMessage = '❌ Flash swap failed: ' + 
-                (error instanceof Error ? error.message : 'Unknown error');
-            await this.bot.editMessageText(errorMessage, {
-                chat_id: chatId,
-                message_id: statusMsg.message_id
-            });
-            throw error;
-        }
-    }
-
-    private async executeFlashArbitrage(tokenMint: string, amount: string, profitTarget: number, msg: TelegramBot.Message) {
-        const chatId = msg.chat.id;
-        
-        // Send initial status
-        const statusMsg = await this.bot.sendMessage(chatId, '🔄 Waiting for profit target...');
-
-        try {
-            // Wait for price increase
-            await this.waitForPriceIncrease(tokenMint, amount, profitTarget);
-
-            // Execute the flash swap
-            await this.executeFlashSwap(tokenMint, amount, msg);
-
-        } catch (error) {
-            // Update status with error
-            const errorMessage = '❌ Flash arbitrage failed: ' + 
-                (error instanceof Error ? error.message : 'Unknown error');
-            await this.bot.editMessageText(errorMessage, {
-                chat_id: chatId,
-                message_id: statusMsg.message_id
-            });
-            throw error;
-        }
-    }
-
-    private async waitForPriceIncrease(tokenMint: string, amount: string, profitTarget: number) {
-        const chatId = this.authorizedUserIds[0]; // Use first authorized user for notifications
-        let statusMsg: TelegramBot.Message | null = null;
-        
-        try {
-            // Get initial price quote
-            const initialQuote = await this.getJupiterPriceQuote(tokenMint, amount);
-            const initialPrice = parseFloat(initialQuote.outAmount) / parseFloat(initialQuote.inAmount);
-            
-            console.log(`📊 Initial price for ${tokenMint}: ${initialPrice}`);
-            
-            // Send initial status
-            statusMsg = await this.bot.sendMessage(chatId, 
-                `🔄 *Flash Arbitrage Monitoring*\n\n` +
-                `*Token:* \`${tokenMint}\`\n` +
-                `*Amount:* ${amount} WSOL\n` +
-                `*Target Profit:* ${profitTarget}%\n` +
-                `*Initial Price:* ${initialPrice.toFixed(6)}\n\n` +
-                `_Waiting for price increase..._`,
-                { parse_mode: 'Markdown' }
-            );
-            
-            const targetPrice = initialPrice * (1 + profitTarget / 100);
-            let attempts = 0;
-            const maxAttempts = 300; // 5 minutes with 1-second intervals
-            const checkInterval = 1000; // 1 second
-            
-            while (attempts < maxAttempts) {
-                await new Promise(resolve => setTimeout(resolve, checkInterval));
-                attempts++;
-                
-                try {
-                    // Get current price quote
-                    const currentQuote = await this.getJupiterPriceQuote(tokenMint, amount);
-                    const currentPrice = parseFloat(currentQuote.outAmount) / parseFloat(currentQuote.inAmount);
-                    const priceChange = ((currentPrice - initialPrice) / initialPrice) * 100;
-                    
-                    // Update status every 10 seconds
-                    if (attempts % 10 === 0) {
-                        const emoji = priceChange >= profitTarget ? '🟢' : '🟡';
-                        await this.bot.editMessageText(
-                            `${emoji} *Flash Arbitrage Monitoring*\n\n` +
-                            `*Token:* \`${tokenMint}\`\n` +
-                            `*Amount:* ${amount} WSOL\n` +
-                            `*Target Profit:* ${profitTarget}%\n` +
-                            `*Current Price:* ${currentPrice.toFixed(6)}\n` +
-                            `*Price Change:* ${priceChange.toFixed(2)}%\n` +
-                            `*Time Elapsed:* ${Math.floor(attempts / 10)}s\n\n` +
-                            `_${priceChange >= profitTarget ? '🎯 Target reached! Executing flash loan...' : 'Waiting for target...'}_`,
-                            {
-                                chat_id: chatId,
-                                message_id: statusMsg.message_id,
-                                parse_mode: 'Markdown'
-                            }
-                        );
-                    }
-                    
-                    // Check if target reached
-                    if (priceChange >= profitTarget) {
-                        console.log(`🎯 Target profit reached! Price change: ${priceChange.toFixed(2)}%`);
-                        
-                        await this.bot.editMessageText(
-                            `🎯 *Target Reached!*\n\n` +
-                            `*Token:* \`${tokenMint}\`\n` +
-                            `*Price Change:* ${priceChange.toFixed(2)}%\n` +
-                            `*Target:* ${profitTarget}%\n\n` +
-                            `_Executing flash loan..._`,
-                            {
-                                chat_id: chatId,
-                                message_id: statusMsg.message_id,
-                                parse_mode: 'Markdown'
-                            }
-                        );
-                        
-                        return; // Exit and execute flash loan
-                    }
-                    
-                } catch (error) {
-                    console.error(`Error checking price (attempt ${attempts}):`, error);
-                    // Continue monitoring even if one check fails
-                }
-            }
-            
-            // Timeout reached
-            throw new Error(`Timeout: Price did not reach ${profitTarget}% target within 5 minutes`);
-            
-        } catch (error) {
-            if (statusMsg) {
-                await this.bot.editMessageText(
-                    `❌ *Flash Arbitrage Failed*\n\n` +
-                    `*Error:* ${error instanceof Error ? error.message : 'Unknown error'}\n\n` +
-                    `_Try again or check token liquidity_`,
-                    {
-                        chat_id: chatId,
-                        message_id: statusMsg.message_id,
-                        parse_mode: 'Markdown'
-                    }
-                );
-            }
-            throw error;
-        }
-    }
-    
-    private async getJupiterPriceQuote(tokenMint: string, amount: string): Promise<any> {
-        const response = await fetch(`https://quote-api.jup.ag/v6/quote?inputMint=So11111111111111111111111111111111111111112&outputMint=${tokenMint}&amount=${amount}&slippageBps=100&onlyDirectRoutes=true&asLegacyTransaction=true`);
-        
-        if (!response.ok) {
-            throw new Error(`Failed to get price quote: ${response.statusText}`);
-        }
-        
-        return response.json();
     }
 
     private getTimeAgo(date: Date): string {

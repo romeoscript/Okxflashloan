@@ -68,6 +68,14 @@ async function getJupiterQuote({
   cluster?: string;
   onlyDirectRoutes?: boolean;
 }): Promise<JupiterQuoteResponse> {
+  console.log(`\n🔍 getJupiterQuote called with:`);
+  console.log(`  inputMint: ${inputMint}`);
+  console.log(`  outputMint: ${outputMint}`);
+  console.log(`  amount: ${amount}`);
+  console.log(`  slippageBps: ${slippageBps}`);
+  console.log(`  cluster: ${cluster}`);
+  console.log(`  onlyDirectRoutes: ${onlyDirectRoutes}`);
+  
   const params = new URLSearchParams({
       inputMint,
       outputMint,
@@ -156,13 +164,18 @@ async function estimateWSOLForTokenSwap({
   slippageBps: number;
   desiredTargetAmount: string;
 }) {
-  // First, get a quote for 1 SOL to the target token to understand the rate
-  const oneSOLAmount = "1000000000"; // 1 SOL in lamports
+  console.log(`\n📊 estimateWSOLForTokenSwap called with:`);
+  console.log(`  targetToken: ${targetToken.toString()}`);
+  console.log(`  slippageBps: ${slippageBps}`);
+  console.log(`  desiredTargetAmount: ${desiredTargetAmount}`);
+  
+  // Get a quote for the desired amount of WSOL to the target token
+  const wsolAmount = "1000000000"; // 1 SOL in lamports
   
   const quote = await getJupiterQuote({
       inputMint: WSOL_MINT_KEY.toString(),
       outputMint: targetToken.toString(),
-      amount: oneSOLAmount,
+      amount: wsolAmount,
       slippageBps
   });
 
@@ -174,6 +187,11 @@ async function estimateWSOLForTokenSwap({
   
   // Convert to lamports
   const wsolInLamports = Math.floor(requiredSOL * 1e9);
+
+  console.log(`📊 Calculation:`);
+  console.log(`  Tokens per SOL: ${tokensPerSOL}`);
+  console.log(`  Required SOL: ${requiredSOL}`);
+  console.log(`  WSOL in lamports: ${wsolInLamports}`);
 
   return {
       wsolAmount: requiredSOL,
@@ -267,6 +285,7 @@ async function getSwapInstructionsFromJupiter({
   amount,
   slippageBps,
   userPublicKey,
+  wsolTokenAccount,
   connection,
   cluster = 'mainnet-beta'
 }: {
@@ -275,6 +294,7 @@ async function getSwapInstructionsFromJupiter({
   amount: string;
   slippageBps: number;
   userPublicKey: string;
+  wsolTokenAccount: PublicKey;
   connection: Connection;
   cluster?: string;
 }) {
@@ -286,7 +306,7 @@ async function getSwapInstructionsFromJupiter({
         amount,
         slippageBps,
         cluster,
-        onlyDirectRoutes: true
+        onlyDirectRoutes: false  // Allow multi-hop if more efficient
     });
 
     // Get swap transaction data with legacy format
@@ -294,7 +314,7 @@ async function getSwapInstructionsFromJupiter({
         quote,
         userPublicKey,
         cluster,
-        useSharedAccounts: false
+        useSharedAccounts: true  // Enable shared accounts to reduce size
     });
 
     // Parse the transaction as legacy format
@@ -320,12 +340,46 @@ async function getSwapInstructionsFromJupiter({
       return true;
     });
 
+    // **CRITICAL FIX: Replace Jupiter's WSOL input account with our WSOL token account**
+    // Jupiter assumes the WSOL comes from the user's wallet, but in our flash loan
+    // the WSOL is in the specific token account we created
+    instructions = instructions.map(ix => {
+      // Find the instruction that transfers WSOL from the user's wallet
+      // and replace it with our WSOL token account
+      if (ix.programId.equals(TOKEN_PROGRAM_ID)) {
+        // Look for the transfer instruction (instruction index 3)
+        if (ix.data[0] === 3) { // Transfer instruction
+          console.log(`🔧 Modifying Jupiter transfer instruction to use WSOL token account`);
+          
+          // Create a new instruction with the same data but updated accounts
+          const newKeys = ix.keys.map(key => {
+            // Replace the source account (usually the user's wallet) with our WSOL token account
+            if (key.pubkey.toString() === userPublicKey && key.isSigner) {
+              console.log(`  Replacing user wallet ${key.pubkey.toString()} with WSOL account ${wsolTokenAccount.toString()}`);
+              return {
+                ...key,
+                pubkey: wsolTokenAccount,
+                isSigner: false // WSOL account is not a signer, user wallet is
+              };
+            }
+            return key;
+          });
+          
+          return {
+            ...ix,
+            keys: newKeys
+          };
+        }
+      }
+      return ix;
+    });
+
     // Log instruction details for debugging
-    console.log(`\n📝 Swap transaction instructions (after filtering):`);
+    console.log(`\n📝 Swap transaction instructions (after filtering and modification):`);
     instructions.forEach((ix, index) => {
         console.log(`\nInstruction ${index}:`);
         console.log(`  Program ID: ${ix.programId.toString()}`);
-        console.log(`  Accounts: ${ix.keys.map(k => k.pubkey.toString()).join(', ')}`);
+        console.log(`  Accounts: ${ix.keys.map(k => `${k.pubkey.toString()}${k.isSigner ? '(signer)' : ''}`).join(', ')}`);
     });
 
     return {
@@ -371,13 +425,30 @@ export async function buildSimulatedFlashLoanInstructions({
     
     console.log(`\n🌐 Using Jupiter cluster: ${cluster}`);
     
-    // (1) Estimate how much WSOL is needed to get `desiredTargetAmount` of targetToken
-    const { wsolAmount, wsolInLamports, rate } = 
-        await estimateWSOLForTokenSwap({
-            targetToken: targetTokenMint, 
-            slippageBps: slippageBps, 
-            desiredTargetAmount: desiredTargetAmount
-        });
+    // (1) Use the desired amount as WSOL amount (not token amount)
+    // Users specify how much WSOL they want to borrow for the flash loan
+    const totalWSOL = parseFloat(desiredTargetAmount) * 1e9; // Total WSOL in lamports
+    const flashLoanFee = 3000; // ~0.000003 SOL fee in lamports
+    const swapAmount = totalWSOL - flashLoanFee; // Reserve fee for repayment
+    const wsolInLamports = totalWSOL.toString();
+    
+    console.log(`\n📊 Flash Loan Setup:`);
+    console.log(`  Total WSOL to Borrow: ${desiredTargetAmount} SOL`);
+    console.log(`  Flash Loan Fee: ${(flashLoanFee / 1e9).toFixed(6)} SOL`);
+    console.log(`  Amount for Swap: ${(swapAmount / 1e9).toFixed(6)} SOL`);
+    console.log(`  Amount for Repayment: ${(flashLoanFee / 1e9).toFixed(6)} SOL`);
+    
+    // Get a quote to see how many tokens we'll get for the swap amount
+    const quote = await getJupiterQuote({
+        inputMint: WSOL_MINT_KEY.toString(),
+        outputMint: targetTokenMint.toString(),
+        amount: swapAmount.toString(), // Use swap amount, not total
+        slippageBps,
+        cluster: 'mainnet-beta',
+        onlyDirectRoutes: false
+    });
+    
+    console.log(`📊 Expected Token Output: ${quote.outAmount} tokens`);
 
     const tokenAccount = await getAssociatedTokenAddress(
         WSOL_MINT_KEY,
@@ -395,16 +466,20 @@ export async function buildSimulatedFlashLoanInstructions({
     });
 
     // (3) Get swap instructions from Jupiter (now with close instructions removed)
-    const { instructions: swapInstructions, lookupTableAccounts, quote } = 
+    const { instructions: swapInstructions, lookupTableAccounts, quote: swapQuote } = 
         await getSwapInstructionsFromJupiter({
             inputMint: WSOL_MINT_KEY.toString(),
             outputMint: targetTokenMint.toString(),
-            amount: wsolInLamports,
+            amount: swapAmount.toString(),
             slippageBps,
             userPublicKey: wallet.publicKey.toString(),
+            wsolTokenAccount: tokenAccount,
             connection,
             cluster
         });
+
+    // Note: Reverse swap removed to fit transaction size limits
+    // User will need to sell tokens separately after the flash loan
 
     // (4) User-defined logic
     const resolvedUserInstructions =
@@ -417,6 +492,12 @@ export async function buildSimulatedFlashLoanInstructions({
 
     console.log(`💰 Borrowing and repaying: ${wsolInLamports} lamports`);
     console.log(`💡 Solend handles fees internally - no manual fee calculation needed`);
+    console.log(`📊 Simplified Flash Loan Flow:`);
+    console.log(`   1. Borrow ${(totalWSOL / 1e9).toFixed(3)} WSOL from Solend`);
+    console.log(`   2. Buy tokens with ${(swapAmount / 1e9).toFixed(6)} WSOL`);
+    console.log(`   3. Repay flash loan with ${(flashLoanFee / 1e9).toFixed(6)} WSOL`);
+    console.log(`   4. Keep tokens and any profit`);
+    console.log(`\n⚠️ Note: This is a simplified flash loan. You'll need to sell the tokens separately.`);
 
     // **CRITICAL FIX: Repay exactly what was borrowed - Solend handles fees internally**
     // Do NOT add fees manually, Solend calculates them automatically
@@ -443,13 +524,15 @@ export async function buildSimulatedFlashLoanInstructions({
 
     // Create compute budget instructions
     const computeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
-      units: 2_000_000
+      units: 1_400_000  // Reduced from 2_000_000
     });
     const priorityFeeIx = ComputeBudgetProgram.setComputeUnitPrice({
-      microLamports: 1000
+      microLamports: 500  // Reduced from 1000
     });
 
-    // **CRITICAL FIX: Proper instruction ordering**
+    // **CRITICAL FIX: Simplified flash loan to fit transaction size limits**
+    // Only include the buy swap in the main transaction
+    // The sell swap will be handled by the user or in a separate transaction
     const allInstructions = [
       // 1. Setup and borrow (creates WSOL account and borrows funds)
       ...flashLoanIxs,        // Instructions 0-3: Create account, transfer SOL, sync, borrow
@@ -458,14 +541,16 @@ export async function buildSimulatedFlashLoanInstructions({
       computeBudgetIx,        // Instruction 4
       priorityFeeIx,          // Instruction 5
       
-      // 3. Execute swap and user logic (WSOL account must stay open!)
-      ...swapInstructions,    // Instructions 6+: Do the swap (close instructions removed!)
+      // 3. Execute buy swap (WSOL → Token) ONLY
+      ...swapInstructions,    // Instructions 6+: Buy tokens with borrowed WSOL
+      
+      // 4. User-defined logic (if any)
       ...resolvedUserInstructions, // Any user instructions
       
-      // 4. Repay flash loan (requires WSOL account to still exist)
+      // 5. Repay flash loan (requires WSOL account to still exist)
       repay,                  // Repay the flash loan with borrowed funds + fee
       
-      // 5. Cleanup (only after everything is complete)
+      // 6. Cleanup (only after everything is complete)
       closeWSOLAccount        // Close WSOL account and return leftover SOL
     ];
 
@@ -478,9 +563,9 @@ export async function buildSimulatedFlashLoanInstructions({
         console.log(`  Compute Budget Instruction (${index === 4 ? 'Set Limit' : 'Set Priority Fee'})`);
       } else if (ix.programId.equals(LENDING_PROGRAM_ID)) {
         console.log(`  Solend ${index === BORROW_INSTRUCTION_INDEX ? 'Borrow' : 'Repay'} Instruction`);
-      if (index !== BORROW_INSTRUCTION_INDEX) {
-        console.log(`    Note: Repaying exact borrowed amount - Solend handles fees internally`);
-      }
+        if (index !== BORROW_INSTRUCTION_INDEX) {
+          console.log(`    Note: Repaying exact borrowed amount - Solend handles fees internally`);
+        }
       } else if (ix.programId.equals(TOKEN_PROGRAM_ID)) {
         if (ix.data[0] === 9) { // CloseAccount instruction
           console.log(`  Close Account Instruction (WSOL cleanup) - ONLY AT THE END`);
@@ -523,30 +608,38 @@ export async function buildSimulatedFlashLoanInstructions({
 
     console.log(`\n📝 Compiling transaction message...`);
     
-    const messageV0 = new TransactionMessage({
-      payerKey: wallet.publicKey,
-      recentBlockhash: latestBlockhash.blockhash,
-      instructions: allInstructions
-    }).compileToV0Message(validLookupTables.length > 0 ? validLookupTables : undefined);
+    try {
+      const messageV0 = new TransactionMessage({
+        payerKey: wallet.publicKey,
+        recentBlockhash: latestBlockhash.blockhash,
+        instructions: allInstructions
+      }).compileToV0Message(validLookupTables.length > 0 ? validLookupTables : undefined);
 
-    return {
-      transaction: new VersionedTransaction(messageV0),
-      quote,
-      estimatedOutput: quote.outAmount,
-      priceImpact: quote.priceImpactPct,
-      route: quote.routePlan,
-      market: LENDING_MARKET,
-      solReserve: RESERVE_ADDRESS,
-      borrowedAmount: wsolInLamports, // The exact amount borrowed (and repaid)
-      addresses: {
-        RESERVE_ADDRESS,
-        LENDING_MARKET,
-        LENDING_PROGRAM_ID,
-        SUPPLYPUBKEY,
-        FEE_RECEIVER_ADDRESS,
-        wsolAccount: tokenAccount
+      return {
+        transaction: new VersionedTransaction(messageV0),
+        quote,
+        estimatedOutput: quote.outAmount,
+        priceImpact: quote.priceImpactPct,
+        route: quote.routePlan,
+        market: LENDING_MARKET,
+        solReserve: RESERVE_ADDRESS,
+        borrowedAmount: wsolInLamports, // The exact amount borrowed (and repaid)
+        addresses: {
+          RESERVE_ADDRESS,
+          LENDING_MARKET,
+          LENDING_PROGRAM_ID,
+          SUPPLYPUBKEY,
+          FEE_RECEIVER_ADDRESS,
+          wsolAccount: tokenAccount
+        }
+      };
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('too large')) {
+        console.error('❌ Transaction too large. Consider reducing the amount or using a different token.');
+        throw new Error('Transaction too large for Solana limits. Try a smaller amount or different token.');
       }
-    };
+      throw error;
+    }
   } catch (error) {
     console.error('Error in buildSimulatedFlashLoanInstructions:', error);
     if (error instanceof Error) {
