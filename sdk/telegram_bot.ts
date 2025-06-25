@@ -2,7 +2,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import axios from 'axios';
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
-import { WalletManager, UserWalletSession } from './wallet_manager';
+import { EmbeddedWalletManager, EmbeddedWalletSession } from './embedded_wallet_manager';
 
 // Bot configuration interface
 interface BotConfig {
@@ -52,37 +52,30 @@ export class SnipingBot {
     private positionSizingConfig: PositionSizingConfig;
     private authorizedUsers: Set<number>;
     private apiBaseUrl: string;
-    private walletManager: WalletManager;
+    private walletManager: EmbeddedWalletManager;
     private readonly welcomeMessage = `
-🚀 *Welcome to the Flash Arbitrage Bot!*
+🚀 *Welcome to Solana Flash Loan Bot\\!*
 
-I'm your automated flash arbitrage assistant for Solana tokens. Here's what I can do:
+This bot provides embedded wallets and flash loan capabilities on Solana\\.
 
-📊 *Token Monitoring*
-• Detect new token launches via API
-• Track token information
-• Monitor liquidity changes
-• Auto-suggest flash arbitrage opportunities
+**Features:**
+• 🎉 Create embedded wallets instantly (one per user)
+• 💱 Flash loan quotes and execution
+• 🔐 Secure wallet management
+• 📊 Real\\-time token monitoring
 
-💰 *Flash Arbitrage Features*
-• Flash loan execution with profit monitoring
-• Real-time price tracking
-• Automatic execution when targets are met
-• Rich Telegram interface
+**Getting Started:**
+1. Create your embedded wallet (one per user)
+2. Get flash loan quotes
+3. Execute flash loans automatically
 
-🔐 *Non-Custodial Security*
-• Connect your own wallet (Phantom, Solflare, etc.)
-• You control your private keys
-• Bot never holds your funds
-• Sign transactions yourself
-
-_Use the buttons below to control the bot:_
-`;
+Your wallet is fully controlled by you \\- we never have access to your funds\\!
+    `;
 
     constructor(token: string, authorizedUserIds: number[], connection: Connection, apiBaseUrl: string = 'http://localhost:3000') {
         this.bot = new TelegramBot(token, { polling: true });
         this.authorizedUserIds = authorizedUserIds;
-        this.walletManager = new WalletManager(connection);
+        this.walletManager = new EmbeddedWalletManager(connection);
         this.config = {
             minLiquidity: 10000,    // $10k minimum liquidity
             maxSlippage: 0.01,      // 1% max slippage
@@ -107,24 +100,15 @@ _Use the buttons below to control the bot:_
         return {
             inline_keyboard: [
                 [
-                    { text: '🔐 Connect Wallet', callback_data: 'connect_wallet' },
-                    { text: '📊 Status', callback_data: 'status' }
+                    { text: '👛 Create Wallet', callback_data: 'create_wallet' },
+                    { text: '📊 Wallet Status', callback_data: 'wallet_status' }
                 ],
                 [
-                    { text: '💰 Flash Quote', callback_data: 'flash_quote' },
-                    { text: '⚡ Flash Swap', callback_data: 'flash_swap' }
+                    { text: '💱 Flash Quote', callback_data: 'flash_quote' },
+                    { text: '📈 Token Monitor', callback_data: 'token_monitor' }
                 ],
                 [
-                    { text: '🆕 Recent Tokens', callback_data: 'recent_tokens' },
-                    { text: '⚙️ Settings', callback_data: 'config' }
-                ],
-                [
-                    { text: '❓ Help', callback_data: 'help' },
-                    { text: '🔄 Flash Arbitrage', callback_data: 'flash_help' }
-                ],
-                [
-                    { text: '▶️ Start Monitoring', callback_data: 'start_monitoring' },
-                    { text: '⏹ Stop Monitoring', callback_data: 'stop_monitoring' }
+                    { text: 'ℹ️ Help', callback_data: 'help' }
                 ]
             ]
         };
@@ -134,11 +118,12 @@ _Use the buttons below to control the bot:_
         return {
             inline_keyboard: [
                 [
-                    { text: '🔗 Connect New Wallet', callback_data: 'connect_new_wallet' },
-                    { text: '❌ Disconnect Wallet', callback_data: 'disconnect_wallet' }
+                    { text: '👛 Wallet Info', callback_data: 'wallet_info' },
+                    { text: '💾 Backup Wallet', callback_data: 'backup_wallet' },
+                    { text: '💸 Export Wallet', callback_data: 'export_wallet' }
                 ],
                 [
-                    { text: '👛 Wallet Info', callback_data: 'wallet_info' },
+                    { text: '❌ Delete Wallet', callback_data: 'delete_wallet' },
                     { text: '🔙 Back to Menu', callback_data: 'main_menu' }
                 ]
             ]
@@ -189,7 +174,7 @@ _Use the buttons below to control the bot:_
                 return;
             }
 
-            await this.handleWalletConnection(msg.chat.id, msg.from!.id);
+            await this.handleConnectWallet(msg.chat.id, msg.from!.id);
         });
 
         // Flash quote command
@@ -199,9 +184,9 @@ _Use the buttons below to control the bot:_
                 return;
             }
 
-            if (!this.walletManager.isWalletConnected(msg.from!.id)) {
+            if (!this.walletManager.hasWallet(msg.from!.id)) {
                 await this.bot.sendMessage(msg.chat.id, 
-                    '❌ Please connect your wallet first using /connect or the "Connect Wallet" button.');
+                    '❌ Please create a wallet first using /createwallet or the "Create Wallet" button.');
                 return;
             }
 
@@ -209,77 +194,65 @@ _Use the buttons below to control the bot:_
             await this.handleFlashQuoteCommand(msg.chat.id, tokenMint, "1"); // Default 1 SOL
         });
 
-        // Handle callback queries (button clicks)
-        this.bot.on('callback_query', async (callbackQuery) => {
-            if (!callbackQuery.message || !this.isAuthorized(callbackQuery.from.id)) {
-                await this.bot.answerCallbackQuery(callbackQuery.id, {
-                    text: '❌ Unauthorized access',
-                    show_alert: true
-                });
+        // Create wallet command
+        this.bot.onText(/\/createwallet/, async (msg) => {
+            if (!this.isAuthorized(msg.from?.id)) {
+                await this.sendUnauthorizedMessage(msg.chat.id);
                 return;
             }
 
-            const chatId = callbackQuery.message.chat.id;
-            const action = callbackQuery.data;
+            await this.handleCreateWallet(msg.chat.id, msg.from!.id);
+        });
 
-            switch (action) {
-                case 'connect_wallet':
-                    await this.handleWalletConnection(chatId, callbackQuery.from.id);
+        // Export wallet command
+        this.bot.onText(/\/exportwallet/, async (msg) => {
+            if (!this.isAuthorized(msg.from?.id)) {
+                await this.sendUnauthorizedMessage(msg.chat.id);
+                return;
+            }
+
+            await this.handleExportWallet(msg.chat.id, msg.from!.id);
+        });
+
+        // Handle callback queries (button clicks)
+        this.bot.on('callback_query', async (callbackQuery) => {
+            const chatId = callbackQuery.message!.chat.id;
+            
+            switch (callbackQuery.data) {
+                case 'main_menu':
+                    await this.showMainMenu(chatId);
                     break;
-                case 'connect_new_wallet':
-                    await this.handleWalletConnection(chatId, callbackQuery.from.id);
+                case 'create_wallet':
+                    await this.handleCreateWallet(chatId, callbackQuery.from.id);
                     break;
-                case 'disconnect_wallet':
-                    await this.handleWalletDisconnection(chatId, callbackQuery.from.id);
+                case 'wallet_status':
+                    await this.handleWalletStatus(chatId, callbackQuery.from.id);
                     break;
                 case 'wallet_info':
                     await this.handleWalletInfo(chatId, callbackQuery.from.id);
                     break;
+                case 'backup_wallet':
+                    await this.handleBackupWallet(chatId, callbackQuery.from.id);
+                    break;
+                case 'export_wallet':
+                    await this.handleExportWallet(chatId, callbackQuery.from.id);
+                    break;
+                case 'delete_wallet':
+                    await this.handleDisconnectWallet(chatId, callbackQuery.from.id);
+                    break;
                 case 'flash_quote':
                     await this.handleFlashQuoteMenu(chatId, callbackQuery.from.id);
                     break;
-                case 'flash_swap':
-                    await this.handleFlashSwapMenu(chatId, callbackQuery.from.id);
-                    break;
-                case 'status':
-                    await this.handleStatusCommand(chatId);
-                    break;
-                case 'config':
-                    await this.handleConfigCommand(chatId);
+                case 'token_monitor':
+                    await this.handleTokenMonitor(chatId, callbackQuery.from.id);
                     break;
                 case 'help':
-                    await this.handleHelpCommand(chatId);
-                    break;
-                case 'recent_tokens':
-                    await this.handleRecentTokensCommand(chatId);
-                    break;
-                case 'flash_help':
-                    await this.handleFlashArbitrageHelp(chatId);
-                    break;
-                case 'start_monitoring':
-                    await this.startMonitoring();
-                    await this.bot.sendMessage(chatId, '✅ Started monitoring for new token launches');
-                    break;
-                case 'stop_monitoring':
-                    await this.stopMonitoring();
-                    await this.bot.sendMessage(chatId, '⏹ Stopped monitoring for new token launches');
-                    break;
-                case 'main_menu':
-                    await this.bot.editMessageText(this.welcomeMessage, {
-                        chat_id: chatId,
-                        message_id: callbackQuery.message.message_id,
-                        parse_mode: 'Markdown',
-                        disable_web_page_preview: true,
-                        reply_markup: this.getMainMenuKeyboard()
-                    });
+                    await this.handleHelp(chatId);
                     break;
                 default:
-                    await this.bot.answerCallbackQuery(callbackQuery.id, {
-                        text: 'Unknown action',
-                        show_alert: true
-                    });
+                    await this.bot.answerCallbackQuery(callbackQuery.id, { text: 'Unknown action' });
             }
-
+            
             await this.bot.answerCallbackQuery(callbackQuery.id);
         });
 
@@ -290,26 +263,32 @@ _Use the buttons below to control the bot:_
             const chatId = msg.chat.id;
             const userId = msg.from!.id;
 
-            // Check if user is in wallet connection mode
-            if (msg.text.startsWith('wallet:')) {
-                await this.handleWalletPublicKey(chatId, userId, msg.text.substring(7).trim());
+            // Handle token mint addresses for flash quotes
+            if (msg.text.length === 44 && /^[A-Za-z0-9]{44}$/.test(msg.text)) {
+                if (this.walletManager.hasWallet(userId)) {
+                    await this.handleFlashQuoteCommand(chatId, msg.text, "1");
+                } else {
+                    await this.bot.sendMessage(chatId, 
+                        '❌ Please create a wallet first using /createwallet or the "Create Wallet" button.');
+                }
             }
         });
     }
 
-    private async handleWalletConnection(chatId: number, userId: number) {
-        const isConnected = this.walletManager.isWalletConnected(userId);
+    private async handleWalletStatus(chatId: number, userId: number) {
+        const walletInfo = this.walletManager.getWalletInfo(userId);
         
-        if (isConnected) {
-            const session = this.walletManager.getUserWallet(userId);
+        if (walletInfo) {
+            const balance = await this.walletManager.getWalletBalance(userId);
             const message = `
-🔐 *Wallet Connected*
+👛 *Wallet Status*
 
-👛 *Wallet Address:* \`${session!.walletPublicKey}\`
-🕐 *Connected:* ${session!.connectedAt.toLocaleString()}
-⏰ *Last Activity:* ${session!.lastActivity.toLocaleString()}
+✅ *Connected:* Yes
+🔑 *Address:* \`${walletInfo.publicKey}\`
+💰 *Balance:* ${balance.toFixed(4)} SOL
+📅 *Created:* ${new Date(walletInfo.connectedAt).toLocaleDateString()}
 
-_Your wallet is ready for flash loans and swaps!_
+Your embedded wallet is ready for flash loans\\!
             `;
             
             await this.bot.sendMessage(chatId, message, {
@@ -317,102 +296,42 @@ _Your wallet is ready for flash loans and swaps!_
                 reply_markup: this.getWalletKeyboard()
             });
         } else {
-            const message = `
-🔐 *Connect Your Wallet*
-
-To use flash loans and swaps, you need to connect your Solana wallet.
-
-**Supported Wallets:**
-• Phantom
-• Solflare
-• Sollet
-• Any wallet that supports Solana
-
-**How to connect:**
-1. Copy your wallet's public key
-2. Send it in this format: \`wallet:YOUR_PUBLIC_KEY\`
-
-**Example:**
-\`wallet:7xKXtg2CW87d97TXJSDpbD5jBkheTqA83TZRuJosgAsU\`
-
-⚠️ *Security Note: Only send your public key, never your private key!*
-            `;
-            
-            await this.bot.sendMessage(chatId, message, {
-                parse_mode: 'Markdown',
-                reply_markup: {
-                    inline_keyboard: [
-                        [{ text: '🔙 Back to Menu', callback_data: 'main_menu' }]
-                    ]
-                }
-            });
+            await this.bot.sendMessage(chatId, '❌ No wallet connected. Use /createwallet to create one.');
         }
     }
 
-    private async handleWalletPublicKey(chatId: number, userId: number, publicKey: string) {
-        try {
-            // Validate the public key
-            new PublicKey(publicKey);
-            
-            // For now, we'll accept the connection without signature verification
-            // In production, you should implement proper signature verification
-            const success = await this.walletManager.verifyWalletConnection(
-                userId,
-                publicKey,
-                '', // No signature for now
-                this.walletManager.generateChallengeMessage(userId)
-            );
-            
-            if (success) {
-                const message = `
-✅ *Wallet Connected Successfully!*
-
-👛 *Wallet Address:* \`${publicKey}\`
-🕐 *Connected:* ${new Date().toLocaleString()}
-
-_Your wallet is now ready for flash loans and swaps!_
-
-**Next Steps:**
-• Use /flashquote TOKEN_MINT to get a quote
-• Use the "Flash Quote" button to get started
-                `;
-                
-                await this.bot.sendMessage(chatId, message, {
-                    parse_mode: 'Markdown',
-                    reply_markup: this.getMainMenuKeyboard()
-                });
-            } else {
-                await this.bot.sendMessage(chatId, '❌ Failed to connect wallet. Please try again.');
-            }
-        } catch (error) {
-            await this.bot.sendMessage(chatId, '❌ Invalid wallet address. Please check and try again.');
-        }
+    private async handleConnectWallet(chatId: number, userId: number) {
+        // For embedded wallets, we create them directly
+        await this.handleCreateWallet(chatId, userId);
     }
 
-    private async handleWalletDisconnection(chatId: number, userId: number) {
-        const success = this.walletManager.disconnectWallet(userId);
+    private async handleDisconnectWallet(chatId: number, userId: number) {
+        const success = this.walletManager.deleteWallet(userId);
         
         if (success) {
-            await this.bot.sendMessage(chatId, '✅ Wallet disconnected successfully.', {
-                reply_markup: this.getMainMenuKeyboard()
-            });
+            await this.bot.sendMessage(chatId, '✅ Wallet deleted successfully.');
         } else {
-            await this.bot.sendMessage(chatId, '❌ No wallet was connected.');
+            await this.bot.sendMessage(chatId, '❌ No wallet found to delete.');
         }
     }
 
     private async handleWalletInfo(chatId: number, userId: number) {
-        const session = this.walletManager.getUserWallet(userId);
+        const walletInfo = this.walletManager.getWalletInfo(userId);
         
-        if (session) {
+        if (walletInfo) {
+            const balance = await this.walletManager.getWalletBalance(userId);
             const message = `
 👛 *Wallet Information*
 
-**Address:** \`${session.walletPublicKey}\`
-**Connected:** ${session.connectedAt.toLocaleString()}
-**Last Activity:** ${session.lastActivity.toLocaleString()}
+🔑 *Address:* \`${walletInfo.publicKey}\`
+💰 *Balance:* ${balance.toFixed(4)} SOL
+📅 *Created:* ${new Date(walletInfo.connectedAt).toLocaleDateString()}
+🕐 *Created Time:* ${new Date(walletInfo.connectedAt).toLocaleTimeString()}
 
-_Your wallet is connected and ready for transactions._
+**Wallet Type:** Embedded Wallet
+**Status:** Active and Ready
+
+Your wallet is ready for flash loans and swaps\\!
             `;
             
             await this.bot.sendMessage(chatId, message, {
@@ -420,14 +339,57 @@ _Your wallet is connected and ready for transactions._
                 reply_markup: this.getWalletKeyboard()
             });
         } else {
-            await this.bot.sendMessage(chatId, '❌ No wallet connected. Please connect a wallet first.');
+            await this.bot.sendMessage(chatId, '❌ No wallet found. Use /createwallet to create one.');
+        }
+    }
+
+    private async handleBackupWallet(chatId: number, userId: number) {
+        const mnemonic = this.walletManager.backupWallet(userId);
+        
+        if (mnemonic) {
+            // Escape special characters for Telegram markdown
+            const escapedMnemonic = mnemonic.replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
+            
+            const message = `
+💾 *Wallet Backup*
+
+🔐 *Seed Phrase:* \`${escapedMnemonic}\`
+
+**Important:**
+• Save this seed phrase securely
+• Never share it with anyone
+• You can import this wallet into Phantom, Solflare, etc\\.
+• This is the only way to recover your wallet
+
+⚠️ *Keep this seed phrase safe\\!*
+            `;
+            
+            await this.bot.sendMessage(chatId, message, {
+                parse_mode: 'Markdown',
+                reply_markup: this.getWalletKeyboard()
+            });
+        } else {
+            await this.bot.sendMessage(chatId, '❌ No wallet found to backup.');
+        }
+    }
+
+    private async handleExportWallet(chatId: number, userId: number) {
+        const exportData = this.walletManager.exportWallet(userId);
+        
+        if (exportData) {
+            await this.bot.sendMessage(chatId, exportData.message, {
+                parse_mode: 'Markdown',
+                reply_markup: this.getWalletKeyboard()
+            });
+        } else {
+            await this.bot.sendMessage(chatId, '❌ No wallet found to export.');
         }
     }
 
     private async handleFlashQuoteMenu(chatId: number, userId: number) {
-        if (!this.walletManager.isWalletConnected(userId)) {
+        if (!this.walletManager.hasWallet(userId)) {
             await this.bot.sendMessage(chatId, 
-                '❌ Please connect your wallet first using the "Connect Wallet" button.');
+                '❌ Please create a wallet first using the "Create Wallet" button.');
             return;
         }
 
@@ -457,22 +419,21 @@ _The default amount is 1 SOL. You can specify a custom amount later._
     }
 
     private async handleFlashSwapMenu(chatId: number, userId: number) {
-        if (!this.walletManager.isWalletConnected(userId)) {
+        if (!this.walletManager.hasWallet(userId)) {
             await this.bot.sendMessage(chatId, 
-                '❌ Please connect your wallet first using the "Connect Wallet" button.');
+                '❌ Please create a wallet first using the "Create Wallet" button.');
             return;
         }
 
         const message = `
 ⚡ *Flash Swap*
 
-To execute a flash swap, first get a quote using /flashquote, then follow the instructions to sign the transaction.
+To execute a flash swap, first get a quote using /flashquote, then follow the instructions to execute the transaction.
 
 **Steps:**
 1. Get a quote: \`/flashquote TOKEN_MINT\`
 2. Review the quote details
-3. Sign the transaction with your wallet
-4. Execute the flash loan
+3. Execute the flash loan (your wallet signs automatically)
 
 ⚠️ *Make sure you have enough SOL in your wallet for transaction fees!*
         `;
@@ -487,13 +448,63 @@ To execute a flash swap, first get a quote using /flashquote, then follow the in
         });
     }
 
+    private async handleCreateWallet(chatId: number, userId: number) {
+        const hasWallet = this.walletManager.hasWallet(userId);
+        
+        if (hasWallet) {
+            const walletInfo = this.walletManager.getWalletInfo(userId);
+            const balance = await this.walletManager.getWalletBalance(userId);
+            const message = `
+🎉 *Wallet Already Exists*
+
+👛 *Wallet Address:* \`${walletInfo!.publicKey}\`
+💰 *Balance:* ${balance.toFixed(4)} SOL
+📅 *Created:* ${new Date(walletInfo!.connectedAt).toLocaleDateString()}
+
+**You can only have one wallet per user.**
+
+**Available Actions:**
+• Use /walletinfo for detailed information
+• Use /backupwallet to get your seed phrase
+• Use /exportwallet to export your private key
+• Use /deletewallet to delete and create a new one
+
+Your embedded wallet is ready for flash loans and swaps\\!
+            `;
+            
+            await this.bot.sendMessage(chatId, message, {
+                parse_mode: 'Markdown',
+                reply_markup: this.getWalletKeyboard()
+            });
+        } else {
+            const statusMsg = await this.bot.sendMessage(chatId, '🔄 Creating your embedded wallet...');
+
+            try {
+                const result = await this.walletManager.generateWalletForUser(userId);
+                
+                await this.bot.editMessageText(result.message, {
+                    chat_id: chatId,
+                    message_id: statusMsg.message_id,
+                    parse_mode: 'Markdown',
+                    reply_markup: this.getWalletKeyboard()
+                });
+            } catch (error) {
+                await this.bot.editMessageText(
+                    '❌ Failed to create wallet: ' + (error instanceof Error ? error.message : 'Unknown error'), {
+                    chat_id: chatId,
+                    message_id: statusMsg.message_id
+                });
+            }
+        }
+    }
+
     private async handleFlashQuoteCommand(chatId: number, tokenMint: string, amount: string) {
         const statusMsg = await this.bot.sendMessage(chatId, '🔄 Getting flash loan quote...');
 
         try {
-            const session = this.walletManager.getUserWallet(chatId);
-            if (!session) {
-                throw new Error('Wallet not connected');
+            const walletInfo = this.walletManager.getWalletInfo(chatId);
+            if (!walletInfo) {
+                throw new Error('Wallet not found');
             }
 
             const response = await axios.get(`${this.apiBaseUrl}/flashswap/quote`, {
@@ -501,7 +512,7 @@ To execute a flash swap, first get a quote using /flashquote, then follow the in
                     targetTokenMint: tokenMint,
                     desiredTargetAmount: amount,
                     slippageBps: this.config.maxSlippage * 10000,
-                    walletPublicKey: session.walletPublicKey
+                    walletPublicKey: walletInfo.publicKey
                 }
             });
 
@@ -519,7 +530,7 @@ To execute a flash swap, first get a quote using /flashquote, then follow the in
 **Next Steps:**
 1. Review the quote above
 2. If you want to proceed, use the "Execute Flash Swap" button
-3. Sign the transaction with your wallet
+3. Your embedded wallet will sign automatically
 4. The flash loan will be executed
 
 ⚠️ *This is a simulation. Actual execution may vary due to market conditions.*
@@ -976,5 +987,74 @@ _Use the buttons below to control the bot:_
     private getTotalTrades(): number {
         // Return 0 since we're not tracking trades
         return 0;
+    }
+
+    private async showMainMenu(chatId: number) {
+        await this.bot.sendMessage(chatId, this.welcomeMessage, {
+            parse_mode: 'Markdown',
+            disable_web_page_preview: true,
+            reply_markup: this.getMainMenuKeyboard()
+        });
+    }
+
+    private async handleTokenMonitor(chatId: number, userId: number) {
+        const message = `
+📈 *Token Monitor*
+
+This feature monitors for new token launches on Solana.
+
+**Status:** Coming Soon
+
+We're working on real-time token monitoring capabilities\\.
+        `;
+        
+        await this.bot.sendMessage(chatId, message, {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '🔙 Back to Menu', callback_data: 'main_menu' }]
+                ]
+            }
+        });
+    }
+
+    private async handleHelp(chatId: number) {
+        const message = `
+❓ *Help & Commands*
+
+**Wallet Commands:**
+• /createwallet \\- Create a new embedded wallet (one per user)
+• /walletstatus \\- Check your wallet status
+• /walletinfo \\- Get detailed wallet information
+• /backupwallet \\- Get your wallet's seed phrase
+• /exportwallet \\- Export your wallet (private key + seed phrase)
+• /deletewallet \\- Delete your wallet
+
+**Flash Loan Commands:**
+• /flashquote TOKEN\\_MINT \\- Get a flash loan quote
+• Example: \`/flashquote EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v\`
+
+**How Flash Loans Work:**
+1. Get a quote for the token you want
+2. Review the estimated output and price impact
+3. Execute the flash loan transaction
+4. Your embedded wallet signs automatically
+
+**Security:**
+• Your seed phrase is your backup \\- keep it safe
+• Never share your seed phrase
+• You can import your wallet to other apps
+
+Need help\\? Contact support\\!
+        `;
+        
+        await this.bot.sendMessage(chatId, message, {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '🔙 Back to Menu', callback_data: 'main_menu' }]
+                ]
+            }
+        });
     }
 } 

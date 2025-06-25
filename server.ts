@@ -6,7 +6,7 @@ import dotenv from 'dotenv';
 import { Wallet } from '@coral-xyz/anchor';
 import bs58 from 'bs58';
 import { monitorNewTokens, NewTokenData } from './src/monitorNewTokens';
-import { WalletManager } from './sdk/wallet_manager';
+import { EmbeddedWalletManager } from './sdk/embedded_wallet_manager';
 import fs from 'fs';
 import path from 'path';
 
@@ -18,44 +18,35 @@ app.use(express.json());
 // Initialize Solana connection and LaunchDetector
 const connection = new Connection(process.env.RPC_ENDPOINT || '', 'confirmed');
 const detector = new LaunchDetector(connection);
-const walletManager = new WalletManager(connection);
+const walletManager = new EmbeddedWalletManager(connection);
 
 // Store new token monitoring state
 let newTokenMonitorCleanup: (() => void) | null = null;
 let isNewTokenMonitoring = false;
 
-// --- Wallet Management Endpoints ---
+// --- Embedded Wallet Management Endpoints ---
 
-// POST /wallet/connect
-// Body: { userId: number, walletPublicKey: string, signature?: string, message?: string }
-app.post('/wallet/connect', async (req, res) => {
+// POST /wallet/create
+// Body: { userId: number }
+app.post('/wallet/create', async (req, res) => {
   try {
-    const { userId, walletPublicKey, signature, message } = req.body;
+    const { userId } = req.body;
     
-    if (!userId || !walletPublicKey) {
+    if (!userId) {
       res.status(400).json({ error: 'Missing required parameters' });
       return;
     }
 
-    const success = await walletManager.verifyWalletConnection(
-      userId,
-      walletPublicKey,
-      signature || '',
-      message || walletManager.generateChallengeMessage(userId)
-    );
-
-    if (success) {
-      res.json({ 
-        status: 'connected',
-        walletPublicKey,
-        message: 'Wallet connected successfully'
-      });
-    } else {
-      res.status(400).json({ error: 'Failed to verify wallet connection' });
-    }
+    const result = await walletManager.generateWalletForUser(userId);
+    
+    res.json({ 
+      status: 'created',
+      publicKey: result.publicKey,
+      message: result.message
+    });
   } catch (err) {
-    console.error('Wallet connection error:', err);
-    res.status(500).json({ error: 'Failed to connect wallet', details: err instanceof Error ? err.message : err });
+    console.error('Wallet creation error:', err);
+    res.status(500).json({ error: 'Failed to create wallet', details: err instanceof Error ? err.message : err });
   }
 });
 
@@ -63,17 +54,16 @@ app.post('/wallet/connect', async (req, res) => {
 app.get('/wallet/status/:userId', (req, res) => {
   try {
     const userId = parseInt(req.params.userId);
-    const session = walletManager.getUserWallet(userId);
+    const walletInfo = walletManager.getWalletInfo(userId);
     
-    if (session) {
+    if (walletInfo) {
       res.json({
-        connected: true,
-        walletPublicKey: session.walletPublicKey,
-        connectedAt: session.connectedAt,
-        lastActivity: session.lastActivity
+        hasWallet: true,
+        publicKey: walletInfo.publicKey,
+        connectedAt: walletInfo.connectedAt
       });
     } else {
-      res.json({ connected: false });
+      res.json({ hasWallet: false });
     }
   } catch (err) {
     console.error('Wallet status error:', err);
@@ -81,20 +71,78 @@ app.get('/wallet/status/:userId', (req, res) => {
   }
 });
 
-// DELETE /wallet/disconnect/:userId
-app.delete('/wallet/disconnect/:userId', (req, res) => {
+// GET /wallet/balance/:userId
+app.get('/wallet/balance/:userId', async (req, res) => {
   try {
     const userId = parseInt(req.params.userId);
-    const success = walletManager.disconnectWallet(userId);
+    const balance = await walletManager.getWalletBalance(userId);
     
-    if (success) {
-      res.json({ status: 'disconnected', message: 'Wallet disconnected successfully' });
+    res.json({
+      balance: balance,
+      balanceSOL: balance.toFixed(4)
+    });
+  } catch (err) {
+    console.error('Wallet balance error:', err);
+    res.status(500).json({ error: 'Failed to get wallet balance' });
+  }
+});
+
+// GET /wallet/backup/:userId
+app.get('/wallet/backup/:userId', (req, res) => {
+  try {
+    const userId = parseInt(req.params.userId);
+    const mnemonic = walletManager.backupWallet(userId);
+    
+    if (mnemonic) {
+      res.json({
+        mnemonic,
+        message: 'Keep this seed phrase safe - it\'s your wallet backup!'
+      });
     } else {
-      res.status(404).json({ error: 'No wallet connected for this user' });
+      res.status(404).json({ error: 'No wallet found to backup' });
     }
   } catch (err) {
-    console.error('Wallet disconnect error:', err);
-    res.status(500).json({ error: 'Failed to disconnect wallet' });
+    console.error('Wallet backup error:', err);
+    res.status(500).json({ error: 'Failed to backup wallet' });
+  }
+});
+
+// GET /wallet/export/:userId
+app.get('/wallet/export/:userId', (req, res) => {
+  try {
+    const userId = parseInt(req.params.userId);
+    const exportData = walletManager.exportWallet(userId);
+    
+    if (exportData) {
+      res.json({
+        publicKey: exportData.publicKey,
+        privateKey: exportData.privateKey,
+        mnemonic: exportData.mnemonic,
+        message: 'Wallet exported successfully - keep your private key and seed phrase secure!'
+      });
+    } else {
+      res.status(404).json({ error: 'No wallet found to export' });
+    }
+  } catch (err) {
+    console.error('Wallet export error:', err);
+    res.status(500).json({ error: 'Failed to export wallet' });
+  }
+});
+
+// DELETE /wallet/delete/:userId
+app.delete('/wallet/delete/:userId', (req, res) => {
+  try {
+    const userId = parseInt(req.params.userId);
+    const success = walletManager.deleteWallet(userId);
+    
+    if (success) {
+      res.json({ status: 'deleted', message: 'Wallet deleted successfully' });
+    } else {
+      res.status(404).json({ error: 'No wallet found to delete' });
+    }
+  } catch (err) {
+    console.error('Wallet delete error:', err);
+    res.status(500).json({ error: 'Failed to delete wallet' });
   }
 });
 
@@ -151,22 +199,26 @@ app.post('/flashswap/create-transaction', async (req, res) => {
       return;
     }
 
-    // Check if user has connected wallet
-    const session = walletManager.getUserWallet(userId);
-    if (!session) {
-      res.status(400).json({ error: 'User wallet not connected' });
+    // Check if user has a wallet
+    const walletInfo = walletManager.getWalletInfo(userId);
+    if (!walletInfo) {
+      res.status(400).json({ error: 'User wallet not found' });
       return;
     }
 
-    // Create a dummy wallet for transaction building
-    const dummyWallet = { publicKey: new PublicKey(session.walletPublicKey) } as Wallet;
+    // Get user's Anchor wallet
+    const userWallet = walletManager.getUserAnchorWallet(userId);
+    if (!userWallet) {
+      res.status(400).json({ error: 'Failed to get user wallet' });
+      return;
+    }
     
     const result = await buildSimulatedFlashLoanInstructions({
       targetTokenMint: new PublicKey(targetTokenMint),
       desiredTargetAmount,
       slippageBps,
       connection,
-      wallet: dummyWallet
+      wallet: userWallet
     });
 
     // Get the latest blockhash
@@ -175,7 +227,7 @@ app.post('/flashswap/create-transaction', async (req, res) => {
     // Create the transaction for user to sign
     const transactionData = {
       transaction: result.transaction.serialize().toString('base64'),
-      message: `Please sign this transaction to execute the flash loan.\n\nTransaction includes:\n- Flash loan from Solend\n- Token swap via Jupiter\n- Flash loan repayment\n\nThis transaction will be executed on your behalf using your connected wallet.`,
+      message: `Your embedded wallet will sign this transaction automatically.\n\nTransaction includes:\n- Flash loan from Solend\n- Token swap via Jupiter\n- Flash loan repayment\n\nThis transaction will be signed and executed automatically.`,
       recentBlockhash: latestBlockhash.blockhash,
       quote: result.quote,
       estimatedOutput: result.estimatedOutput,
@@ -203,10 +255,10 @@ app.post('/flashswap/execute-signed', async (req, res) => {
       return;
     }
 
-    // Check if user has connected wallet
-    const session = walletManager.getUserWallet(userId);
-    if (!session) {
-      res.status(400).json({ error: 'User wallet not connected' });
+    // Check if user has a wallet
+    const walletInfo = walletManager.getWalletInfo(userId);
+    if (!walletInfo) {
+      res.status(400).json({ error: 'User wallet not found' });
       return;
     }
 
@@ -215,7 +267,7 @@ app.post('/flashswap/execute-signed', async (req, res) => {
     const transaction = VersionedTransaction.deserialize(transactionBuffer);
 
     // Execute the signed transaction
-    const signature = await walletManager.executeSignedTransaction(userId, transaction);
+    const signature = await walletManager.executeTransactionWithUserWallet(userId, transaction);
     const explorerUrl = `https://solscan.io/tx/${signature}`;
 
     res.json({
@@ -229,21 +281,28 @@ app.post('/flashswap/execute-signed', async (req, res) => {
   }
 });
 
-// GET /flashswap/quote?targetTokenMint=...&desiredTargetAmount=...&slippageBps=...&walletPublicKey=...
+// GET /flashswap/quote?targetTokenMint=...&desiredTargetAmount=...&slippageBps=...&userId=...
 app.get('/flashswap/quote', async (req, res) => {
   try {
-    const { targetTokenMint, desiredTargetAmount, slippageBps = 100, walletPublicKey } = req.query;
-    if (!targetTokenMint || !desiredTargetAmount || !walletPublicKey) {
+    const { targetTokenMint, desiredTargetAmount, slippageBps = 100, userId } = req.query;
+    if (!targetTokenMint || !desiredTargetAmount || !userId) {
       res.status(400).json({ error: 'Missing required parameters' });
       return;
     }
-    const dummyWallet = { publicKey: new PublicKey(walletPublicKey as string) } as Wallet;
+
+    // Get user's Anchor wallet
+    const userWallet = walletManager.getUserAnchorWallet(parseInt(userId as string));
+    if (!userWallet) {
+      res.status(400).json({ error: 'User wallet not found' });
+      return;
+    }
+
     const result = await buildSimulatedFlashLoanInstructions({
       targetTokenMint: new PublicKey(targetTokenMint as string),
       desiredTargetAmount: desiredTargetAmount as string,
       slippageBps: Number(slippageBps),
       connection,
-      wallet: dummyWallet
+      wallet: userWallet
     });
     res.json({
       quote: result.quote,
@@ -387,14 +446,14 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
     timestamp: new Date().toISOString(),
-    connectedUsers: walletManager.getConnectedUsers().length
+    connectedUsers: walletManager.getAllWallets().length
   });
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📊 Connected users: ${walletManager.getConnectedUsers().length}`);
+  console.log(`📊 Connected users: ${walletManager.getAllWallets().length}`);
 });
 
 export { app, walletManager }; 
