@@ -25,6 +25,3 @@ Thumbs.db
 
 # Data files
 src/data/*.json
-
-bot.ts
-floan.ts
